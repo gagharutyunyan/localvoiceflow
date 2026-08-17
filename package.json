@@ -1,0 +1,17 @@
+{
+  "name": "local-voice-flow",
+  "version": "0.1.0",
+  "private": true,
+  "description": "LocalVoiceFlow — local-first voice dictation for macOS (Apple Silicon)",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "packageManager": "pnpm@9.15.9",
+  "scripts": {
+    "build": "pnpm -r --filter @lvf/shared build && pnpm --filter @lvf/web build && pnpm --filter @lvf/core build",
+    "dev": "pnpm --filter @lvf/core dev",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test"
+  }
+}

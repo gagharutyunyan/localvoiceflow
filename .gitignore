@@ -1,0 +1,55 @@
+# dependencies
+node_modules/
+.pnpm-store/
+
+# build output
+dist/
+build/
+*.tsbuildinfo
+apps/web/dist/
+apps/core/dist/
+packages/shared/dist/
+apps/mac-agent/.build/
+apps/mac-agent/build/
+LocalVoiceFlow.app/
+
+# python
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.uv/
+
+# local runtime / user data — NEVER commit
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+.runtime/
+logs/
+*.log
+
+# secrets / tokens — NEVER commit
+token
+*.token
+.env
+.env.*
+!.env.example
+auth.json
+
+# audio captured by the user
+fixtures/audio/*.wav
+fixtures/audio/*.aiff
+!fixtures/audio/.gitkeep
+!fixtures/audio/README.md
+
+# benchmark output
+benchmark-results/
+
+# macOS
+.DS_Store
+
+# IDE (keep .idea out of the repo)
+.idea/
+.vscode/
