@@ -140,7 +140,7 @@ async function main(): Promise<void> {
   ctxHolder.ctx = ctx;
 
   const webDir = process.env.LVF_WEB_DIR ?? join(repoRoot, "apps", "web", "dist");
-  const { app, dashboardUrl } = buildServer({ ctx, webDir });
+  const { app, dashboardUrl, closeEventStreams } = buildServer({ ctx, webDir });
 
   await app.listen({ host, port });
 
@@ -155,12 +155,26 @@ async function main(): Promise<void> {
     if (shuttingDown) return;
     shuttingDown = true;
     logger.info("core shutting down", { signal });
+
+    // Never let shutdown hang. A process that keeps running after SIGTERM releases its
+    // listening socket but holds its existing connections, so a restart produces two live
+    // processes and clients stay attached to the outgoing one.
+    const guard = setTimeout(() => {
+      logger.warn("shutdown timed out; exiting anyway", { signal });
+      process.exit(0);
+    }, 5_000);
+    guard.unref();
+
     try {
+      // Before `app.close()`: it waits for in-flight requests, and an SSE stream never
+      // completes on its own.
+      closeEventStreams();
       await app.close();
       await sttWorker?.stop();
       db.close();
       await logger.close();
     } finally {
+      clearTimeout(guard);
       process.exit(0);
     }
   };

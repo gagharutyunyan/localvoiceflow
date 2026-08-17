@@ -27,6 +27,8 @@ export interface BuiltServer {
   token: string;
   sessionToken: string;
   dashboardUrl: (host: string, port: number) => string;
+  /** Ends every open SSE stream. Must run before `app.close()`, which waits on them. */
+  closeEventStreams: () => void;
 }
 
 export function buildServer(options: BuildServerOptions): BuiltServer {
@@ -36,6 +38,9 @@ export function buildServer(options: BuildServerOptions): BuiltServer {
   // A separate value: the cookie is exposed to the browser, the file token is not, so a
   // leaked cookie cannot be replayed as a bearer credential.
   const sessionToken = randomBytes(32).toString("hex");
+
+  /** Teardown callbacks for the currently open SSE streams. */
+  const openEventStreams = new Set<() => void>();
 
   const app = Fastify({
     logger: false,
@@ -207,9 +212,24 @@ export function buildServer(options: BuildServerOptions): BuiltServer {
     // notice a dead server quickly.
     const heartbeat = setInterval(() => reply.raw.write(": ping\n\n"), 15_000);
 
+    const close = () => {
+      clearInterval(heartbeat);
+      unsubscribe();
+      openEventStreams.delete(close);
+      reply.raw.end();
+    };
+
+    // An event stream is a request that never finishes on its own, and `app.close()` waits
+    // for in-flight requests. Without this registry a restart left the old process alive
+    // forever: it dropped its listening socket, so the new one bound the port, but it kept
+    // the agent's stream open — the agent never saw a disconnect and never re-registered
+    // with the new process, leaving the two halves talking to different cores.
+    openEventStreams.add(close);
+
     request.raw.on("close", () => {
       clearInterval(heartbeat);
       unsubscribe();
+      openEventStreams.delete(close);
     });
 
     return reply;
@@ -257,5 +277,10 @@ export function buildServer(options: BuildServerOptions): BuiltServer {
     token,
     sessionToken,
     dashboardUrl: (host, port) => `http://${host}:${port}/session?token=${token}`,
+    closeEventStreams: () => {
+      // Iterate a copy: each callback removes itself from the set.
+      for (const close of [...openEventStreams]) close();
+      openEventStreams.clear();
+    },
   };
 }

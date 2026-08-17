@@ -1,7 +1,7 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 import { buildClaudeArgs, parseClaudeOutput, sanitizeClaudeMetadata } from "../dist/providers/claude.js";
-import { buildCodexArgs, parseCodexOutput } from "../dist/providers/codex.js";
+import { buildCodexArgs, parseCodexLoginStatus, parseCodexOutput } from "../dist/providers/codex.js";
 import { API_KEY_ENV_VARS, detectApiKeyEnv, runCli, subscriptionOnlyEnv } from "../dist/providers/spawn.js";
 import { classifyCliFailure, summarizeStderr } from "../dist/providers/errors.js";
 
@@ -95,6 +95,49 @@ describe("codex command builder", () => {
 
   test("does not pass --ask-for-approval, which codex 0.147 exec does not accept", () => {
     assert.ok(!args.includes("--ask-for-approval"));
+  });
+});
+
+describe("codex login status", () => {
+  test("recognises a login reported on stderr", () => {
+    // Regression: the real CLI prints this on stderr. Reading stdout alone reported an
+    // authenticated CLI as signed out and disabled the provider entirely.
+    const status = parseCodexLoginStatus({
+      code: 0,
+      stdout: "",
+      stderr: "Logged in using ChatGPT\n",
+    });
+    assert.equal(status.authenticated, true);
+    assert.equal(status.detail, "ChatGPT subscription");
+  });
+
+  test("recognises a login reported on stdout", () => {
+    const status = parseCodexLoginStatus({
+      code: 0,
+      stdout: "Logged in using ChatGPT\n",
+      stderr: "",
+    });
+    assert.equal(status.authenticated, true);
+  });
+
+  test("a signed-out CLI is reported as not logged in", () => {
+    const status = parseCodexLoginStatus({
+      code: 1,
+      stdout: "",
+      stderr: "Not logged in. Run `codex login`.\n",
+    });
+    assert.equal(status.authenticated, false);
+    assert.equal(status.detail, "not logged in");
+  });
+
+  test("a non-zero exit is never treated as authenticated", () => {
+    // Guards against the message appearing in an error path.
+    const status = parseCodexLoginStatus({
+      code: 2,
+      stdout: "Logged in using ChatGPT",
+      stderr: "",
+    });
+    assert.equal(status.authenticated, false);
   });
 });
 

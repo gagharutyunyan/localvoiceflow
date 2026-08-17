@@ -577,6 +577,48 @@ describe("fallback provider behaviour", () => {
   });
 });
 
+describe("shutdown", () => {
+  let h: Harness;
+
+  before(() => {
+    h = makeHarness("shutdown");
+  });
+  after(() => {
+    h.db.close();
+    rmSync(h.dir, { recursive: true, force: true });
+  });
+
+  test("an open event stream does not keep the server from closing", async () => {
+    // Regression: `app.close()` waits for in-flight requests and an SSE stream never ends
+    // on its own, so shutdown hung forever. The process kept running after SIGTERM — it
+    // had released its listening socket, so a restart bound a second process to the port
+    // while the agent stayed attached to the outgoing one and never re-registered.
+    const address = await h.server.app.listen({ host: "127.0.0.1", port: 0 });
+
+    const controller = new AbortController();
+    const response = await fetch(`${address}/api/events`, {
+      headers: { authorization: `Bearer ${h.server.token}` },
+      signal: controller.signal,
+    });
+    assert.equal(response.status, 200);
+
+    // Read the first frame so the stream is definitely established server-side.
+    const reader = response.body!.getReader();
+    await reader.read();
+
+    h.server.closeEventStreams();
+
+    const closed = h.server.app.close().then(() => "closed" as const);
+    const timedOut = new Promise<"timeout">((resolve) => {
+      setTimeout(() => resolve("timeout"), 4000).unref();
+    });
+    assert.equal(await Promise.race([closed, timedOut]), "closed");
+
+    controller.abort();
+    await reader.cancel().catch(() => {});
+  });
+});
+
 describe("local server security", () => {
   let h: Harness;
 

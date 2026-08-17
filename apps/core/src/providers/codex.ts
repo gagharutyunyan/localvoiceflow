@@ -119,6 +119,28 @@ function extractLastJsonObject(text: string): string | undefined {
   return last;
 }
 
+/**
+ * Reads the outcome of `codex login status`.
+ *
+ * The CLI prints "Logged in using ChatGPT" on **stderr**, not stdout. An earlier version
+ * inspected stdout alone, so the health check reported "not signed in" for a CLI that was
+ * perfectly authenticated and the provider refused every request. Both streams are
+ * considered here; no account identifier is extracted from either.
+ */
+export function parseCodexLoginStatus(run: {
+  code: number | null;
+  stdout: string;
+  stderr: string;
+}): { authenticated: boolean; detail: string } {
+  const text = `${run.stdout}\n${run.stderr}`.trim();
+  const authenticated = run.code === 0 && /logged in/i.test(text);
+  if (!authenticated) return { authenticated: false, detail: "not logged in" };
+  return {
+    authenticated: true,
+    detail: /chatgpt/i.test(text) ? "ChatGPT subscription" : "logged in",
+  };
+}
+
 export class CodexCliProvider implements TextCorrectionProvider {
   readonly id = "openai-codex-cli" as const;
 
@@ -174,14 +196,9 @@ export class CodexCliProvider implements TextCorrectionProvider {
         env,
         timeoutMs: 20_000,
       });
-      const text = loginRun.stdout.trim();
-      authenticated = loginRun.code === 0 && /logged in/i.test(text);
-      // The line reads "Logged in using ChatGPT"; no account identifier is extracted.
-      authDetail = authenticated
-        ? /chatgpt/i.test(text)
-          ? "ChatGPT subscription"
-          : "logged in"
-        : "not logged in";
+      const status = parseCodexLoginStatus(loginRun);
+      authenticated = status.authenticated;
+      authDetail = status.detail;
     } catch (loginError) {
       authDetail = "could not determine login status";
       error ??= String(loginError);
