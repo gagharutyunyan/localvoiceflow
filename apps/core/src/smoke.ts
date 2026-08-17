@@ -5,6 +5,7 @@ import type { CorrectionInput, ProviderId, TextCorrectionProvider } from "@lvf/s
 import { ClaudeCliProvider } from "./providers/claude.js";
 import { CodexCliProvider } from "./providers/codex.js";
 import { resolvePaths, ensureDirectories } from "./paths.js";
+import { containsTerm, leaksTerm } from "./fixture-match.js";
 
 /**
  * Real-provider smoke test. Kept out of the unit suite on purpose: it spends the user's
@@ -134,9 +135,11 @@ async function main(): Promise<void> {
 
       // Quality is judged by required terms and meaning preservation, never by exact
       // string equality — the model may legitimately phrase the sentence differently.
-      const missing = fixture.mustContain.filter((needle) => !result.finalText.includes(needle));
+      const missing = fixture.mustContain.filter(
+        (needle) => !containsTerm(result.finalText, needle),
+      );
       const leaked = (fixture.mustNotContain ?? []).filter((needle) =>
-        result.finalText.includes(needle),
+        leaksTerm(result.finalText, needle),
       );
       const ok = missing.length === 0 && leaked.length === 0;
       if (ok) passed += 1;

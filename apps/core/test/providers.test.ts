@@ -4,6 +4,7 @@ import { buildClaudeArgs, parseClaudeOutput, sanitizeClaudeMetadata } from "../d
 import { buildCodexArgs, parseCodexLoginStatus, parseCodexOutput } from "../dist/providers/codex.js";
 import { API_KEY_ENV_VARS, detectApiKeyEnv, runCli, subscriptionOnlyEnv } from "../dist/providers/spawn.js";
 import { classifyCliFailure, summarizeStderr } from "../dist/providers/errors.js";
+import { containsTerm, leaksTerm } from "../dist/fixture-match.js";
 
 describe("claude command builder", () => {
   test("emits the subscription-safe flag set", () => {
@@ -95,6 +96,28 @@ describe("codex command builder", () => {
 
   test("does not pass --ask-for-approval, which codex 0.147 exec does not accept", () => {
     assert.ok(!args.includes("--ask-for-approval"));
+  });
+});
+
+describe("fixture term matching", () => {
+  test("an identifier must keep its exact casing", () => {
+    assert.equal(containsTerm("этот useEffect снова вызывает fetch", "useEffect"), true);
+    assert.equal(containsTerm("этот useeffect снова вызывает fetch", "useEffect"), false);
+    assert.equal(containsTerm("добавь AbortController", "AbortController"), true);
+    assert.equal(containsTerm("добавь abortcontroller", "AbortController"), false);
+  });
+
+  test("an ordinary word survives sentence capitalisation", () => {
+    // The model may drop a leading "Этот", which capitalises the next word. The term still
+    // survived, so reporting it missing would flag correct output as a regression.
+    assert.equal(containsTerm("Компонент слишком большой", "компонент"), true);
+    assert.equal(containsTerm("Этот компонент слишком большой", "компонент"), true);
+    assert.equal(containsTerm("тут ничего похожего нет", "компонент"), false);
+  });
+
+  test("a leak is caught in any casing", () => {
+    assert.equal(leaksTerm("этот Юз Эффект остался", "юз эффект"), true);
+    assert.equal(leaksTerm("этот useEffect исправлен", "юз эффект"), false);
   });
 });
 

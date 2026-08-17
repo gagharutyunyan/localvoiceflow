@@ -14,6 +14,7 @@ import { ClaudeCliProvider } from "./providers/claude.js";
 import { CodexCliProvider } from "./providers/codex.js";
 import { MockCorrectionProvider } from "./providers/mock.js";
 import { resolvePaths, ensureDirectories } from "./paths.js";
+import { containsTerm } from "./fixture-match.js";
 import {
   SttWorkerClient,
   defaultWorkerDir,
@@ -135,6 +136,7 @@ interface TextFixture {
   raw: string;
   mustContain: string[];
 }
+
 
 function loadTextFixtures(root: string): TextFixture[] {
   const file = join(root, "fixtures", "transcription", "ru-technical.json");
@@ -324,7 +326,7 @@ async function main(): Promise<void> {
 
         // Quality is checked by required terms, not string equality: the model is free
         // to phrase the sentence differently as long as the meaning-bearing terms survive.
-        const missing = fixture.mustContain.filter((needle) => !corrected.finalText.includes(needle));
+        const missing = fixture.mustContain.filter((needle) => !containsTerm(corrected.finalText, needle));
         sample.ok = missing.length === 0;
         if (!sample.ok) sample.error = `missing terms: ${missing.join(", ")}`;
       } catch (error) {
