@@ -123,6 +123,32 @@ step "Assembling $LVF_APP_BUNDLE"
 SOURCE_PLIST="$LVF_MAC_AGENT_DIR/Resources/Info.plist"
 CONTENTS="$LVF_APP_BUNDLE/Contents"
 
+# Re-signing produces a new code identity, and macOS ties Microphone / Accessibility /
+# Input Monitoring to that identity: rebuilding silently revoked every permission the
+# user had just granted. When nothing actually changed there is no reason to pay that
+# price, so an unchanged binary leaves the installed bundle exactly as it is.
+#
+# The installed executable cannot be compared directly — codesign embeds the signature
+# into it, so it is never byte-identical to the build output. The hash of the *unsigned*
+# source binary is recorded in the bundle instead.
+STAMP_FILE="$CONTENTS/Resources/.source-sha256"
+SOURCE_SHA=""
+[[ -f "$AGENT_BINARY" ]] && SOURCE_SHA="$(shasum -a 256 "$AGENT_BINARY" | cut -d' ' -f1)"
+
+if [[ -n "$SOURCE_SHA" && -f "$STAMP_FILE" ]] && [[ "$SOURCE_SHA" == "$(cat "$STAMP_FILE" 2>/dev/null)" ]]; then
+  if codesign --verify --strict "$LVF_APP_BUNDLE" 2>/dev/null; then
+    ok "приложение не изменилось — оставляю установленное как есть"
+    ok "выданные разрешения macOS сохранены"
+    note "Пересобрать принудительно: rm -rf \"$LVF_APP_BUNDLE\" && make build"
+    step "Done"
+    printf '  app:   %s\n' "$LVF_APP_BUNDLE"
+    printf '  core:  %s\n' "$LVF_CORE_ENTRY"
+    lvf_summary
+    exit 0
+  fi
+  note "бинарник тот же, но подпись повреждена — пересобираю бандл"
+fi
+
 mkdir -p "$HOME/Applications"
 rm -rf "$LVF_APP_BUNDLE"
 mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Resources"
@@ -204,6 +230,12 @@ fi
 # ---------------------------------------------------------------------------
 
 step "Signing"
+
+# Written before signing on purpose: the signature seals Contents/Resources, so a file
+# added afterwards invalidates the bundle with "a sealed resource is missing or invalid".
+if [[ -n "$SOURCE_SHA" ]]; then
+  printf '%s' "$SOURCE_SHA" >"$STAMP_FILE"
+fi
 
 DEVELOPER_ID="$(security find-identity -v -p codesigning 2>/dev/null |
   sed -n 's/.*"\(Developer ID Application:[^"]*\)".*/\1/p' | head -n 1 || true)"

@@ -43,6 +43,21 @@ lvf_require_macos_arm64
 
 [[ "$(id -u)" != "0" ]] || die "Do not run install.sh with sudo — it installs into your own user domain."
 
+# Повторный запуск — это переустановка поверх, а не второй экземпляр: LaunchAgent
+# выгружается и загружается заново, .app пересобирается на месте, данные не трогаются.
+# Без этой строки непонятно, что происходит при втором `make install`.
+step "Режим установки"
+if [[ -d "$LVF_APP_BUNDLE" || -f "$LVF_PLIST" ]]; then
+  REINSTALL=1
+  note "Найдена предыдущая установка — переустанавливаю поверх"
+  [[ -d "$LVF_APP_BUNDLE" ]] && ok "заменю приложение: $LVF_APP_BUNDLE"
+  [[ -f "$LVF_PLIST" ]] && ok "перезагружу автозапуск: $LVF_PLIST"
+  ok "история, словарь и настройки останутся нетронутыми"
+else
+  REINSTALL=0
+  note "Первая установка"
+fi
+
 # ---------------------------------------------------------------------------
 # Build
 # ---------------------------------------------------------------------------
@@ -230,14 +245,37 @@ fi
 
 DASHBOARD_URL="$(lvf_dashboard_url)"
 
-step "Ready"
-printf '  Dashboard: %s%s%s\n' "$LVF_C_BOLD" "$DASHBOARD_URL" "$LVF_C_RESET"
-printf '  Logs:      %s\n' "$LVF_LOGS_DIR"
-printf '  Data:      %s\n' "$LVF_DATA_DIR"
-printf '  Doctor:    make doctor\n'
+step "Готово"
+if ((REINSTALL == 1)); then
+  ok "Переустановлено поверх прежней версии, данные сохранены"
+else
+  ok "Установлено"
+fi
+printf '  Панель:  %s%s%s\n' "$LVF_C_BOLD" "$DASHBOARD_URL" "$LVF_C_RESET"
+printf '  Логи:    %s\n' "$LVF_LOGS_DIR"
+printf '  Данные:  %s\n' "$LVF_DATA_DIR"
+
+# Разрешения — единственное, что отделяет пользователя от рабочей диктовки, и
+# единственное, что нельзя сделать за него. Поэтому это последнее, что он видит.
+MIC_STATE="$(lvf_api_get "/api/status" 2>/dev/null | lvf_json_find "microphone" 2>/dev/null || true)"
+INP_STATE="$(lvf_api_get "/api/status" 2>/dev/null | lvf_json_find "inputMonitoring" 2>/dev/null || true)"
+ACC_STATE="$(lvf_api_get "/api/status" 2>/dev/null | lvf_json_find "accessibility" 2>/dev/null || true)"
+
+printf '\n'
+if [[ "$MIC_STATE" == "granted" && "$INP_STATE" == "granted" && "$ACC_STATE" == "granted" ]]; then
+  ok "Все разрешения macOS уже выданы — можно говорить"
+  printf '  Зажмите %sFn%s, скажите фразу, отпустите. Проверка: %smake status%s\n' \
+    "$LVF_C_BOLD" "$LVF_C_RESET" "$LVF_C_BOLD" "$LVF_C_RESET"
+else
+  warn "Осталось выдать разрешения macOS — без них диктовка не заработает"
+  printf '\n  %sСледующий шаг:%s\n\n      %smake permissions%s\n\n' \
+    "$LVF_C_BOLD" "$LVF_C_RESET" "$LVF_C_BOLD" "$LVF_C_RESET"
+  printf '  Это пошаговый мастер: он сам откроет нужные окна системных настроек\n'
+  printf '  и проверит результат.\n'
+fi
 
 if ((OPEN_DASHBOARD == 1)); then
-  open "$DASHBOARD_URL" >/dev/null 2>&1 || warn "could not open the browser; copy the URL above"
+  open "$DASHBOARD_URL" >/dev/null 2>&1 || warn "не удалось открыть браузер — скопируйте адрес выше"
 fi
 
 lvf_summary

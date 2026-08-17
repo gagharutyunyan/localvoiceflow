@@ -269,6 +269,21 @@ a {
   font-size: 12px;
 }
 
+/* Пояснение внутри карточки: почему показанное состояние такое и что с ним делать. */
+.card-note {
+  margin: 0 0 12px;
+  padding: 8px 10px;
+  border-left: 3px solid var(--border);
+  background: var(--surface-muted, rgba(127, 127, 127, 0.08));
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.card-note code {
+  font-size: 12px;
+}
+
 @media (max-width: 620px) {
   .field-row {
     grid-template-columns: 1fr;

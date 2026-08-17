@@ -170,32 +170,52 @@ export function Dashboard() {
         </Card>
 
         <Card
-          title="Permissions"
-          subtitle="Reported by the macOS agent"
+          title="Разрешения macOS"
+          subtitle={
+            permissions?.agentConnected
+              ? "Что сообщает приложение из строки меню"
+              : "Приложение не на связи — данные ниже устарели"
+          }
           actions={
             <StatusPill tone={permissions?.agentConnected ? "ok" : "warn"}>
-              {permissions?.agentConnected ? "agent connected" : "agent offline"}
+              {permissions?.agentConnected ? "приложение на связи" : "приложение офлайн"}
             </StatusPill>
           }
         >
-          <FieldRow label="Microphone">
+          {/* Показывать последние известные значения как текущие, когда агент офлайн, —
+              значит врать: разрешения могли поменяться, а прочитать их некому. */}
+          {!permissions?.agentConnected && (
+            <p className="card-note">
+              Запустите приложение в строке меню: <code>make start</code>. Пока его нет,
+              состояние разрешений прочитать невозможно — их видит только оно.
+            </p>
+          )}
+          <FieldRow label="Микрофон">
             <StatusPill tone={permissionTone(permissions?.microphone)}>
               {permissionLabel(permissions?.microphone)}
             </StatusPill>
           </FieldRow>
-          <FieldRow label="Accessibility">
+          <FieldRow label="Универсальный доступ">
             <StatusPill tone={permissionTone(permissions?.accessibility)}>
               {permissionLabel(permissions?.accessibility)}
             </StatusPill>
           </FieldRow>
-          <FieldRow label="Input Monitoring">
+          <FieldRow label="Мониторинг ввода">
             <StatusPill tone={permissionTone(permissions?.inputMonitoring)}>
               {permissionLabel(permissions?.inputMonitoring)}
             </StatusPill>
           </FieldRow>
-          <FieldRow label="Reported">
+          <FieldRow label={permissions?.agentConnected ? "Обновлено" : "Последний ответ"}>
             {permissions?.reportedAt ? formatDateTime(permissions.reportedAt) : EM_DASH}
           </FieldRow>
+          {(permissions?.microphone !== "granted" ||
+            permissions?.accessibility !== "granted" ||
+            permissions?.inputMonitoring !== "granted") && (
+            <p className="card-note">
+              Не все разрешения выданы — диктовка не заработает. Пошаговый мастер:{" "}
+              <code>make permissions</code>
+            </p>
+          )}
         </Card>
 
         <Card

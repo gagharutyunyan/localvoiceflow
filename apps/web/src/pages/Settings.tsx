@@ -540,18 +540,30 @@ export function Settings() {
             onChange={(v) => patchGeneral({ soundFeedbackEnabled: v })}
           />
           <Toggle
-            label="Fn key as push-to-talk"
+            label="Клавиша Fn как push-to-talk"
             checked={draft.general.fnTriggerEnabled}
             onChange={(v) => patchGeneral({ fnTriggerEnabled: v })}
           />
           <Toggle
-            label="Fallback hotkey enabled"
+            label="Резервное сочетание включено"
             checked={draft.general.fallbackHotkeyEnabled}
             onChange={(v) => patchGeneral({ fallbackHotkeyEnabled: v })}
           />
-          <Labeled label="Fallback hotkey">
+          <Labeled
+            label="Резервное сочетание"
+            hint={
+              <>
+                Формат: модификаторы и клавиша через «+», например{" "}
+                <code>control+option+space</code>, <code>command+shift+d</code>,{" "}
+                <code>control+option+v</code>. Допустимые модификаторы: <code>control</code>,{" "}
+                <code>option</code>, <code>shift</code>, <code>command</code>. Работает, даже
+                когда Fn перехвачена системой.
+              </>
+            }
+          >
             <input
               value={draft.general.fallbackHotkey}
+              placeholder="control+option+space"
               onChange={(event) => patchGeneral({ fallbackHotkey: event.target.value })}
             />
           </Labeled>

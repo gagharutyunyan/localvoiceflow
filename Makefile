@@ -11,7 +11,7 @@ LIB := $(REPO)/scripts/_lib.sh
 # Extra arguments for the wrapped script, e.g. `make benchmark ARGS="--runs=5"`.
 ARGS ?=
 
-.PHONY: help bootstrap dev build install start stop restart doctor test fixtures benchmark \
+.PHONY: help bootstrap dev build install start stop restart status permissions dashboard doctor test fixtures benchmark \
         uninstall uninstall-purge smoke-claude smoke-openai fmt clean
 
 help: ## Show this help
@@ -55,6 +55,24 @@ stop: ## Stop core and the menu-bar agent
 
 restart: ## Restart core and the menu-bar agent
 	@"$(REPO)/scripts/restart.sh" $(ARGS)
+
+status: ## Показать, запущено ли всё и можно ли уже говорить
+	@"$(REPO)/scripts/status.sh" || true
+
+permissions: ## Пошагово выдать три разрешения macOS (микрофон, Fn, вставка)
+	@"$(REPO)/scripts/permissions.sh"
+
+dashboard: ## Открыть панель управления в браузере
+	@source "$(LIB)"; \
+	if ! lvf_core_reachable; then \
+	  warn "Ядро не запущено — запускаю"; \
+	  "$(REPO)/scripts/start-core.sh" >/dev/null 2>&1 || true; \
+	  lvf_wait_for_core 30 || true; \
+	fi; \
+	url="$$(lvf_dashboard_url)"; \
+	if [ -z "$$url" ]; then fail "Не удалось получить адрес панели"; hint "make start"; exit 1; fi; \
+	ok "Открываю $$url"; \
+	open "$$url"
 
 doctor: ## Diagnose permissions, core, STT and both LLM CLIs
 	@"$(REPO)/scripts/doctor.sh" $(ARGS)

@@ -249,17 +249,27 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, MenuBarDelegate
         pollTimer?.invalidate()
         // TCC state can change while the app runs (the user flips a switch in System Settings);
         // there is no notification for it, so it has to be polled.
+        var ticksSinceReport = 0
         let timer = Timer(timeInterval: 5, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self else { return }
                 let previous = self.permissions
                 self.refreshPermissions()
+                ticksSinceReport += 1
                 if previous != self.permissions {
+                    ticksSinceReport = 0
                     self.reportStatus()
                     // Input Monitoring may have just been granted — the tap can work now.
                     if self.serviceEnabled, self.config.fnTriggerEnabled, !self.hotkeys.state.fnTapActive {
                         self.hotkeys.startFnTap()
                     }
+                } else if ticksSinceReport >= 4 {
+                    // Heartbeat. Core treats a report older than a minute as "agent gone", and
+                    // reportStatus() alone is deduplicated by payload, so a healthy agent whose
+                    // permissions never change went silent and showed up as offline after a
+                    // minute even though it was running and connected.
+                    ticksSinceReport = 0
+                    self.reportStatus(force: true)
                 }
                 self.refreshMenu()
             }
