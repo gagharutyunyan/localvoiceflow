@@ -16,7 +16,7 @@ import { csvToTerms, jsonToTerms, parseCsv } from "../lib/csv";
 import { EM_DASH } from "../lib/format";
 import { withIdsSelected } from "../lib/selection";
 
-const LANGUAGES: TermLanguage[] = ["ru", "en", "mixed"];
+const LANGUAGES: TermLanguage[] = ["ru", "en", "hy", "mixed"];
 
 interface EditorState {
   id: string | null;

@@ -1,6 +1,6 @@
 import type { DictionaryTermInput, TermLanguage } from "@lvf/shared";
 
-const LANGUAGES: readonly string[] = ["ru", "en", "mixed"];
+const LANGUAGES: readonly string[] = ["ru", "en", "hy", "mixed"];
 
 function detectDelimiter(sample: string): string {
   const firstLine = sample.split(/\r?\n/, 1)[0] ?? "";

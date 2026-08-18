@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { FormattingProfile, ProviderId } from "./settings.js";
+import type { FormattingProfile, ProviderId, SttLanguage } from "./settings.js";
 
 // ---------------------------------------------------------------------------
 // Speech-to-text
@@ -21,8 +21,12 @@ export interface SttHealth {
 export interface SttInput {
   /** Absolute path to a mono 16 kHz PCM WAV file readable by the worker. */
   audioPath: string;
-  /** "auto" means let Whisper detect the language. */
-  language: "auto" | "ru" | "en";
+  /**
+   * "auto" means let Whisper detect the language. Reuses `SttLanguage` rather than
+   * repeating the union: a second copy of the list is a second place to forget when a
+   * language is added, and it only announces itself as a compile error much later.
+   */
+  language: SttLanguage;
   /** Short glossary hint injected as the Whisper initial prompt. */
   initialPrompt?: string;
   requestId: string;

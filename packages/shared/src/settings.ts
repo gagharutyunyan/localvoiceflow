@@ -52,7 +52,12 @@ export const EffortSchema = z
 export const FormattingProfileSchema = z.enum(["minimal", "smart", "structured", "developer"]);
 export type FormattingProfile = z.infer<typeof FormattingProfileSchema>;
 
-export const SttLanguageSchema = z.enum(["auto", "ru", "en"]);
+/**
+ * Languages the dictation path is offered for. Whisper itself knows 99 — these are the
+ * ones the product is set up for end to end: the STT hint, the editor prompt and the
+ * dictionary tags all agree on them. `hy` is Armenian (`armenian` in Whisper's own table).
+ */
+export const SttLanguageSchema = z.enum(["auto", "ru", "en", "hy"]);
 export type SttLanguage = z.infer<typeof SttLanguageSchema>;
 
 export const TargetChangedBehaviorSchema = z.enum([

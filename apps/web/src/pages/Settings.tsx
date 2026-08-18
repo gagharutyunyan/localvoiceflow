@@ -32,6 +32,14 @@ const PRIVACY_LLM_SCOPE =
 
 const LAST_CHECK_PREFIX = "lvf.provider-check.";
 
+/** Whisper takes the bare code; a picker showing "hy" alone tells the user nothing. */
+const STT_LANGUAGE_LABELS: Record<string, string> = {
+  auto: "auto — detect per recording",
+  ru: "ru — Русский",
+  en: "en — English",
+  hy: "hy — Հայերեն (Armenian)",
+};
+
 /**
  * Quick presets only touch latency-vs-quality knobs; the model id is left alone so a
  * preset can never silently switch the user onto a model their subscription lacks.
@@ -691,7 +699,7 @@ export function Settings() {
             >
               {SttLanguageSchema.options.map((value) => (
                 <option key={value} value={value}>
-                  {value}
+                  {STT_LANGUAGE_LABELS[value] ?? value}
                 </option>
               ))}
             </select>

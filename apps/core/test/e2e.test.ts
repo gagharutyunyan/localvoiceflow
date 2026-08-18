@@ -172,6 +172,43 @@ describe("end-to-end pipeline with mock providers", () => {
     assert.equal(record.totalLatencyMs, outcome.totalLatencyMs);
   });
 
+  test("Armenian is a first-class dictation language, end to end", async () => {
+    h.db.patchSettings({ stt: { language: "hy" } });
+    h.stt.configure({
+      transcript: "բարև ձեզ սա փորձնական թելադրություն է",
+      detectedLanguage: "hy",
+      noSpeech: false,
+    });
+    const sttCallsBefore = h.stt.calls.length;
+
+    try {
+      const response = await h.server.app.inject({
+        method: "POST",
+        url: "/api/dictations",
+        headers: {
+          "content-type": "audio/wav",
+          authorization: `Bearer ${h.server.token}`,
+          "x-lvf-audio-duration-ms": "6200",
+        },
+        payload: makeWav(),
+      });
+
+      const outcome = response.json() as { id: string; status: string; text: string };
+      assert.equal(outcome.status, "completed");
+      // The code reaches Whisper as-is...
+      assert.equal(h.stt.calls[sttCallsBefore]?.language, "hy");
+      // ...and the LLM is told which language it must not translate away from.
+      assert.equal(h.llm.calls.at(-1)?.input.language, "hy");
+      assert.ok(outcome.text.includes("թելադրություն"), outcome.text);
+      assert.equal(h.db.getDictation(outcome.id)?.detectedLanguage, "hy");
+    } finally {
+      // `beforeEach` resets the transcript but not the detected language or the setting,
+      // and a leaked "hy" would quietly rewrite what every later test asserts.
+      h.db.patchSettings({ stt: { language: "ru" } });
+      h.stt.configure({ detectedLanguage: "ru" });
+    }
+  });
+
   test("the profile is chosen from the target app's bundle id", async () => {
     h.llm.calls.length = 0;
     await h.server.app.inject({

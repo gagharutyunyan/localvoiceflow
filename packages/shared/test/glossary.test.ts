@@ -179,6 +179,21 @@ describe("deterministic replacement", () => {
     assert.equal(applyDeterministicReplacements(decomposed, TERMS).text, decomposed);
   });
 
+  test("Armenian aliases are matched and rewritten like any other script", () => {
+    // Armenian case-folds without changing length (unlike "İ" below), so the pass may run
+    // on it — worth pinning down now that `hy` is a selectable dictation language.
+    const terms = [term("Docker", ["դոկեր"]), ...TERMS];
+    const { text, hits } = applyDeterministicReplacements(
+      "ՊԵՏՔ Է տեղադրել դոկեր և գործարկել юз эффект",
+      terms,
+    );
+    assert.ok(text.includes("Docker"), text);
+    assert.ok(text.includes("useEffect"), text);
+    assert.equal(hits.length, 2);
+    // Everything around the replacements is untouched, casing included.
+    assert.ok(text.startsWith("ՊԵՏՔ Է տեղադրել "), text);
+  });
+
   test("text whose case-folding changes length is left untouched, not corrupted", () => {
     // "İ" lowercases to two code units even under a Russian locale, so normalized offsets
     // stop lining up; the pass must stand down instead of slicing at wrong positions.

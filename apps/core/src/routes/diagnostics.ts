@@ -179,7 +179,11 @@ export function registerDiagnosticsRoutes(app: FastifyInstance, ctx: ServerConte
       const started = process.hrtime.bigint();
       const result = await ctx.stt.transcribe({
         audioPath: fixture,
-        language: ctx.db.getSettings().stt.language,
+        // The fixture is Russian, so it is decoded as Russian. Using the user's dictation
+        // language here would decode a Russian sentence as, say, Armenian and report the
+        // resulting nonsense as a broken STT worker — this check is about the worker and
+        // the model being alive, not about which language the user dictates in.
+        language: "ru",
         requestId: `diag_${Date.now()}`,
       });
       return reply.send({

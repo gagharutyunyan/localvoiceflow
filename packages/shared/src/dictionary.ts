@@ -1,6 +1,7 @@
 import { z } from "zod";
 
-export const TermLanguageSchema = z.enum(["ru", "en", "mixed"]);
+/** A label on a term, never a filter: every enabled term is offered whatever the language. */
+export const TermLanguageSchema = z.enum(["ru", "en", "hy", "mixed"]);
 export type TermLanguage = z.infer<typeof TermLanguageSchema>;
 
 export const DictionaryTermSchema = z.object({
