@@ -1,6 +1,6 @@
 import {
   PipelineError,
-  serializeCorrectionPayload,
+  correctionPayloadJson,
   type CorrectionInput,
   type CorrectionResult,
   type ProviderConfig,
@@ -99,13 +99,16 @@ export class LocalMlxProvider implements TextCorrectionProvider {
       );
     }
 
-    const payload = serializeCorrectionPayload(input);
+    // The bare JSON, not the CLI preamble: the addendum in the system prompt already
+    // frames the message as data and demands plain text back — a structured-output
+    // instruction here would contradict it and confuse a 4B model.
+    const payload = correctionPayloadJson(input);
     const startedAt = process.hrtime.bigint();
 
     const result = await this.#worker.correct(
       {
         systemPrompt: buildLocalSystemPrompt(config.systemPrompt),
-        payload: payload.text,
+        payload,
       },
       config.timeoutMs,
       signal,

@@ -92,6 +92,7 @@ function makeHarness(name: string): Harness {
     port: 43117,
     repoRoot: join(import.meta.dirname, "..", "..", ".."),
     onSttSettingsChanged: () => {},
+    onCorrectionSettingsChanged: () => {},
   });
   holder.ctx = ctx;
 

@@ -124,6 +124,32 @@ public final class HotkeyMonitor {
     public func startFnTap() -> Bool {
         guard eventTap == nil else { return true }
 
+        // Ask before tapping, and do not tap without an answer.
+        //
+        // Creating an event tap without Input Monitoring looks harmless — `tapCreate` even
+        // succeeds — but it is the single most destructive thing this app can do to its own
+        // setup. macOS shows no prompt, writes no record, and simply marks *this process* as
+        // denied for the rest of its life. From then on `IOHIDRequestAccess` is a no-op, so the
+        // button in the onboarding window can never produce the system dialog, and System
+        // Settings → Input Monitoring stays an empty list with nothing to switch on. That empty
+        // list is where "just drag the app in from Finder" comes from.
+        //
+        // `IOHIDRequestAccess` is the call that shows the prompt and creates the row. It matters
+        // only on the very first launch; afterwards it returns the recorded answer immediately.
+        var permission = Permissions.inputMonitoring()
+        if permission == .notDetermined {
+            permission = Permissions.requestInputMonitoring()
+            AgentLog.info("input monitoring prompt shown at startup: \(permission.rawValue)")
+        }
+        guard permission == .granted else {
+            let reason = permission == .denied
+                ? "нет разрешения «Мониторинг ввода»"
+                : "состояние разрешения «Мониторинг ввода» неизвестно"
+            updateState(fnTapActive: false, fnTapError: reason)
+            AgentLog.warn("Fn event tap not installed: \(reason)")
+            return false
+        }
+
         let mask: CGEventMask =
             (1 << CGEventType.flagsChanged.rawValue) |
             (1 << CGEventType.keyDown.rawValue)
@@ -140,18 +166,9 @@ public final class HotkeyMonitor {
         )
 
         guard let tap else {
-            let permission = Permissions.inputMonitoring()
-            let reason: String
-            switch permission {
-            case .granted:
-                reason = "macOS отклонил создание event tap (проверьте «Мониторинг ввода» для LocalVoiceFlow)"
-            case .denied:
-                reason = "нет разрешения «Мониторинг ввода»"
-            case .notDetermined:
-                reason = "разрешение «Мониторинг ввода» ещё не выдано"
-            case .unknown:
-                reason = "состояние разрешения «Мониторинг ввода» неизвестно"
-            }
+            // Permission is granted at this point, so a refusal here is macOS itself saying no —
+            // most often because the grant landed after this process started.
+            let reason = "macOS отклонил создание event tap — перезапустите LocalVoiceFlow"
             updateState(fnTapActive: false, fnTapError: reason)
             AgentLog.error("Fn event tap could not be created: \(reason)")
             return false

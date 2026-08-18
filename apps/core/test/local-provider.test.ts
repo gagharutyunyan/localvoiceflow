@@ -100,6 +100,31 @@ function waitForReady(client: LlmWorkerClient): Promise<void> {
   });
 }
 
+/** Runs the body and always stops the client — a leaked child keeps the event loop alive. */
+async function withClient(body: (client: LlmWorkerClient) => Promise<void>): Promise<void> {
+  const client = makeClient();
+  try {
+    await body(client);
+  } finally {
+    await client.stop();
+  }
+}
+
+function pollUntil(check: () => boolean, what: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const startedAt = Date.now();
+    const timer = setInterval(() => {
+      if (check()) {
+        clearInterval(timer);
+        resolve();
+      } else if (Date.now() - startedAt > 5000) {
+        clearInterval(timer);
+        reject(new Error(`timed out waiting for ${what}`));
+      }
+    }, 10);
+  });
+}
+
 describe("LlmWorkerClient against a scripted worker", () => {
   test("start → ready → correct → stop round trip", async () => {
     const client = makeClient();
@@ -124,39 +149,38 @@ describe("LlmWorkerClient against a scripted worker", () => {
   });
 
   test("warm resolves and flips warmedPrompt via the status event", async () => {
-    const client = makeClient();
-    client.start();
-    await waitForReady(client);
-    await client.warm("Ты — редактор.");
-    // The unsolicited status event lands asynchronously right after the reply.
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    assert.equal(client.currentHealth.warmedPrompt, true);
-    await client.stop();
+    await withClient(async (client) => {
+      client.start();
+      await waitForReady(client);
+      await client.warm("Ты — редактор.");
+      // The unsolicited status event lands asynchronously right after the reply.
+      await pollUntil(() => client.currentHealth.warmedPrompt === true, "warmedPrompt");
+    });
   });
 
   test("a request that never answers times out as llm_timeout", async () => {
-    const client = makeClient();
-    client.start();
-    await waitForReady(client);
-    await assert.rejects(
-      client.correct({ systemPrompt: "s", payload: "SLOW" }, 300),
-      (error: Error & { code?: string }) => error.code === "llm_timeout",
-    );
-    await client.stop();
+    await withClient(async (client) => {
+      client.start();
+      await waitForReady(client);
+      await assert.rejects(
+        client.correct({ systemPrompt: "s", payload: "SLOW" }, 300),
+        (error: Error & { code?: string }) => error.code === "llm_timeout",
+      );
+    });
   });
 
   test("an aborted request rejects as cancelled", async () => {
-    const client = makeClient();
-    client.start();
-    await waitForReady(client);
-    const controller = new AbortController();
-    const pending = assert.rejects(
-      client.correct({ systemPrompt: "s", payload: "SLOW" }, 5000, controller.signal),
-      (error: Error & { code?: string }) => error.code === "cancelled",
-    );
-    setTimeout(() => controller.abort(), 50);
-    await pending;
-    await client.stop();
+    await withClient(async (client) => {
+      client.start();
+      await waitForReady(client);
+      const controller = new AbortController();
+      const pending = assert.rejects(
+        client.correct({ systemPrompt: "s", payload: "SLOW" }, 5000, controller.signal),
+        (error: Error & { code?: string }) => error.code === "cancelled",
+      );
+      setTimeout(() => controller.abort(), 50);
+      await pending;
+    });
   });
 
   test("correct without a running worker fails fast", async () => {
@@ -168,29 +192,30 @@ describe("LlmWorkerClient against a scripted worker", () => {
   });
 
   test("reconfigure with a new model restarts the running worker", async () => {
-    const client = makeClient();
-    const calls = (client as unknown as { spawnCalls: string[][] }).spawnCalls;
-    client.start();
-    await waitForReady(client);
-    assert.equal(calls.length, 1);
-    assert.deepEqual(calls[0].slice(-2), ["--model", "fake/qwen"]);
+    await withClient(async (client) => {
+      const calls = (client as unknown as { spawnCalls: string[][] }).spawnCalls;
+      client.start();
+      await waitForReady(client);
+      assert.equal(calls.length, 1);
+      assert.deepEqual(calls[0].slice(-2), ["--model", "fake/qwen"]);
 
-    const restarted = client.reconfigure({ model: "fake/other" });
-    assert.equal(restarted, true);
-    await waitForReady(client);
-    assert.equal(calls.length, 2);
-    assert.deepEqual(calls[1].slice(-2), ["--model", "fake/other"]);
-    await client.stop();
+      const restarted = client.reconfigure({ model: "fake/other" });
+      assert.equal(restarted, true);
+      // The restart is asynchronous (stop → start); wait for the second spawn.
+      await pollUntil(() => calls.length === 2, "the restart spawn");
+      assert.deepEqual(calls[1].slice(-2), ["--model", "fake/other"]);
+      await pollUntil(() => client.currentHealth.ready, "ready after restart");
+    });
   });
 
   test("reconfigure with the same model does not restart", async () => {
-    const client = makeClient();
-    const calls = (client as unknown as { spawnCalls: string[][] }).spawnCalls;
-    client.start();
-    await waitForReady(client);
-    assert.equal(client.reconfigure({ model: "fake/qwen" }), false);
-    assert.equal(calls.length, 1);
-    await client.stop();
+    await withClient(async (client) => {
+      const calls = (client as unknown as { spawnCalls: string[][] }).spawnCalls;
+      client.start();
+      await waitForReady(client);
+      assert.equal(client.reconfigure({ model: "fake/qwen" }), false);
+      assert.equal(calls.length, 1);
+    });
   });
 });
 

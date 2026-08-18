@@ -182,54 +182,59 @@ public final class OnboardingController: NSObject, NSWindowDelegate {
     /// Accessibility lists*. Merely checking (`IOHIDCheckAccess` / `AXIsProcessTrusted`) never
     /// creates the row, so a user sent straight to the pane would find nothing to switch on.
     private func request(_ kind: PermissionKind) {
-        // Never both at once. macOS's own dialog already carries an "Open System Settings"
-        // button, so opening the pane alongside it throws two windows at the user for one click.
-        // The pane is for the second press, once macOS has stopped offering the dialog.
-        let askedBefore = hasAskedBefore(kind)
-        markAsked(kind)
-
+        // The request is the part that matters: `AXIsProcessTrustedWithOptions(prompt: true)`,
+        // `IOHIDRequestAccess` and `AVCaptureDevice.requestAccess` are what *create the row* in
+        // System Settings. Checking never does, and neither does opening the pane — a user sent
+        // straight to a list with no row for the app has nothing to switch on, which is how
+        // "drag the app in from Finder" became folklore. So it always runs.
+        //
+        // Whether to also open the pane is decided from the permission state, never from a
+        // remembered flag. A flag stored in UserDefaults outlives the app itself: reinstalling
+        // leaves it behind in ~/Library/Preferences, and the fresh install then skips the prompt
+        // it has never actually shown.
         switch kind {
         case .microphone:
+            // `.notDetermined` is the one state where macOS still shows its own dialog.
+            let couldPrompt = Permissions.microphone() == .notDetermined
+            AgentLog.info("microphone request: \(Permissions.microphone().rawValue), prompt=\(couldPrompt)")
             Permissions.requestMicrophone { [weak self] state in
-                MainActor.assumeIsolated {
-                    guard let self else { return }
-                    if state != .granted, askedBefore { Permissions.openSettings(kind.pane) }
-                    self.refresh()
+                // AVFoundation answers on TCC's XPC reply queue, not on the main thread.
+                // `assumeIsolated` is an assertion, not a hop: stating "I am on the main actor"
+                // where it is false traps and takes the process down with it.
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated {
+                        guard let self else { return }
+                        if state != .granted, !couldPrompt { Permissions.openSettings(kind.pane) }
+                        self.refresh()
+                    }
                 }
             }
 
         case .inputMonitoring:
+            let before = Permissions.inputMonitoring()
+            let couldPrompt = before == .notDetermined
             let state = Permissions.requestInputMonitoring()
-            if state != .granted, askedBefore { Permissions.openSettings(kind.pane) }
+            AgentLog.info("input monitoring request: \(before.rawValue) -> \(state.rawValue)")
+            if state != .granted, !couldPrompt { Permissions.openSettings(kind.pane) }
             refresh()
 
         case .accessibility:
-            let state = Permissions.requestAccessibility(prompt: !askedBefore)
-            if state != .granted, askedBefore { Permissions.openSettings(kind.pane) }
+            // Accessibility has no "not determined": macOS reports an untrusted process as
+            // denied whether it was asked before or not, so there is no way to know in advance
+            // whether the dialog will appear. Ask, then give it a moment to show up — and open
+            // the pane only if nothing came of it.
+            let before = Permissions.accessibility()
+            let state = Permissions.requestAccessibility(prompt: true)
+            AgentLog.info("accessibility request: \(before.rawValue) -> \(state.rawValue)")
             refresh()
-        }
-    }
-
-    /// Whether this app has already raised the system dialog for a permission.
-    ///
-    /// This is what removes the "drag the app into the list" step. The row in System Settings is
-    /// created by the *request* — `AXIsProcessTrustedWithOptions(prompt: true)` and
-    /// `IOHIDRequestAccess` — never by checking, and never by opening the pane. So the first
-    /// press always asks, which puts the row there; only afterwards does the button send the
-    /// user to a list that is guaranteed to contain LocalVoiceFlow.
-    private func hasAskedBefore(_ kind: PermissionKind) -> Bool {
-        UserDefaults.standard.bool(forKey: Self.askedKey(kind))
-    }
-
-    private func markAsked(_ kind: PermissionKind) {
-        UserDefaults.standard.set(true, forKey: Self.askedKey(kind))
-    }
-
-    private static func askedKey(_ kind: PermissionKind) -> String {
-        switch kind {
-        case .microphone: return "askedMicrophone"
-        case .inputMonitoring: return "askedInputMonitoring"
-        case .accessibility: return "askedAccessibility"
+            let deadline = DispatchTime.now() + .milliseconds(2000)
+            DispatchQueue.main.asyncAfter(deadline: deadline) { [weak self] in
+                guard let self else { return }
+                if Permissions.accessibility() != .granted {
+                    Permissions.openSettings(kind.pane)
+                }
+                self.refresh()
+            }
         }
     }
 

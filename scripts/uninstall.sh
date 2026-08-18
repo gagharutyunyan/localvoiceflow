@@ -180,6 +180,13 @@ if ((REMOVE_SIGNING == 1)); then
   else
     ok "связки ключей не было"
   fi
+
+  # add-trusted-cert кладёт копию сертификата в ту связку, где заводит доверие, поэтому одна
+  # копия остаётся в login.keychain и потом двоится в выводе find-identity.
+  while security delete-certificate -c "$SIGNING_CERT_NAME" \
+    "$HOME/Library/Keychains/login.keychain-db" >/dev/null 2>&1; do
+    ok "удалена копия сертификата из login.keychain"
+  done
 fi
 
 # ---------------------------------------------------------------------------
@@ -196,6 +203,17 @@ safe_to_delete() {
 
 if ((PURGE == 1)); then
   step "Данные"
+
+  # Настройки приложения живут не в папке данных, а в общей базе настроек macOS, и удаление
+  # бандла их не трогает. Пережившие удаление ключи — худший вид мусора: следующая установка
+  # считает себя уже настроенной и, например, не показывает запрос разрешения, который на
+  # самом деле ни разу не показывала.
+  defaults delete "$LVF_BUNDLE_ID" >/dev/null 2>&1 && ok "настройки приложения удалены" ||
+    ok "настроек приложения не было"
+  rm -f "$HOME/Library/Preferences/${LVF_BUNDLE_ID}.plist"
+  # Настройки кэшируются демоном cfprefsd; без этого файл возвращается из памяти.
+  killall cfprefsd >/dev/null 2>&1 || true
+
   for target in "$LVF_DATA_DIR" "$LVF_LOGS_DIR"; do
     if ! safe_to_delete "$target"; then
       fail "отказываюсь удалять неожиданный путь: $target"
