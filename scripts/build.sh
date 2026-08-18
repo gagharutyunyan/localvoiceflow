@@ -237,18 +237,38 @@ if [[ -n "$SOURCE_SHA" ]]; then
   printf '%s' "$SOURCE_SHA" >"$STAMP_FILE"
 fi
 
+LOCAL_CERT_NAME="LocalVoiceFlow Local Signing"
+
 DEVELOPER_ID="$(security find-identity -v -p codesigning 2>/dev/null |
   sed -n 's/.*"\(Developer ID Application:[^"]*\)".*/\1/p' | head -n 1 || true)"
+
+local_identity_present() {
+  security find-identity -v -p codesigning 2>/dev/null | grep -qF "$LOCAL_CERT_NAME"
+}
+
+# A signature that changes on every build is the single worst thing that can happen to this
+# app: macOS keys Microphone / Accessibility / Input Monitoring to the signature, so an
+# ad-hoc rebuild silently revokes all three. The local certificate exists to prevent that,
+# and creating it is cheap enough to do here rather than making it a step the user has to
+# know about.
+if [[ -z "$DEVELOPER_ID" ]] && ! local_identity_present; then
+  note "нет сертификата для подписи — создаю постоянный локальный"
+  "$LVF_SCRIPT_DIR/signing-identity.sh" >/dev/null 2>&1 || true
+fi
 
 if [[ -n "$DEVELOPER_ID" ]]; then
   codesign --force --deep --options runtime --sign "$DEVELOPER_ID" "$LVF_APP_BUNDLE"
   ok "signed with Developer ID: $DEVELOPER_ID"
   note "Not notarized — Gatekeeper will still ask on first launch of a downloaded copy."
+elif local_identity_present && codesign --force --deep --sign "$LOCAL_CERT_NAME" "$LVF_APP_BUNDLE" 2>/dev/null; then
+  ok "signed with the local certificate: $LOCAL_CERT_NAME"
+  note "The signature stays the same across rebuilds, so macOS permissions survive them."
 else
   codesign --force --deep --sign - "$LVF_APP_BUNDLE"
-  ok "ad-hoc signed (no Developer ID identity in the keychain)"
-  note "An ad-hoc signature changes on every rebuild, so macOS may re-ask for"
-  note "Microphone / Accessibility / Input Monitoring after a rebuild."
+  warn "ad-hoc signed — no signing identity available"
+  note "An ad-hoc signature changes on every rebuild, so macOS re-asks for"
+  note "Microphone / Accessibility / Input Monitoring after every build."
+  hint "Fix it once: scripts/signing-identity.sh"
 fi
 
 if codesign --verify --strict "$LVF_APP_BUNDLE" 2>/dev/null; then

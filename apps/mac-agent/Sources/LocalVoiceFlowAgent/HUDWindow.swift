@@ -49,6 +49,9 @@ public final class HUDController {
     private var durationTimer: Timer?
     private var autoHideTimer: Timer?
     private var recordingStartedAt: Date?
+    /// Invalidates an in-flight fade-out when a new show() lands mid-animation, so the
+    /// completion of the old fade cannot orderOut the freshly presented panel.
+    private var fadeGeneration = 0
 
     public init() {}
 
@@ -132,8 +135,12 @@ public final class HUDController {
             scheduleAutoHide(after: 4.0)
         }
 
-        layoutPanel()
-        panel?.orderFrontRegardless()
+        if case .recording = newState {
+            setIndicatorPulsing(true)
+        } else {
+            setIndicatorPulsing(false)
+        }
+        presentPanel()
     }
 
     /// Live microphone level, 0...1.
@@ -146,8 +153,40 @@ public final class HUDController {
         stopDurationTimer()
         autoHideTimer?.invalidate()
         autoHideTimer = nil
-        panel?.orderOut(nil)
         state = .hidden
+        guard let panel, panel.isVisible else { return }
+        fadeGeneration += 1
+        let generation = fadeGeneration
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = 0.12
+            panel.animator().alphaValue = 0
+        }, completionHandler: { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self, self.fadeGeneration == generation else { return }
+                panel.orderOut(nil)
+            }
+        })
+    }
+
+    /// Puts the panel on screen: instantly sized, faded in when it was not visible,
+    /// resized with a short animation when it already was.
+    private func presentPanel() {
+        guard let panel else { return }
+        fadeGeneration += 1
+        let appearing = !panel.isVisible || panel.alphaValue < 1
+        layoutPanel(animated: !appearing)
+        if appearing {
+            // A brand-new presentation starts transparent; a show() that interrupts a
+            // fade-out picks the alpha up from wherever the fade left it.
+            if !panel.isVisible { panel.alphaValue = 0 }
+            panel.orderFrontRegardless()
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.14
+                panel.animator().alphaValue = 1
+            }
+        } else {
+            panel.orderFrontRegardless()
+        }
     }
 
     // MARK: - Panel construction
@@ -271,7 +310,9 @@ public final class HUDController {
     }
 
     /// Sizes the panel to its current content and re-centres it at the bottom of the screen.
-    private func layoutPanel() {
+    /// Animated when the panel is already on screen, so the compact→wide growth glides
+    /// instead of snapping; instant while appearing, so the fade-in shows the final shape.
+    private func layoutPanel(animated: Bool) {
         guard let panel else { return }
         let text = transcriptLabel?.stringValue ?? ""
         let width = text.isEmpty ? Self.compactWidth : Self.wideWidth
@@ -279,11 +320,29 @@ public final class HUDController {
         if !text.isEmpty {
             height += Self.transcriptHeight(text, width: width - Self.horizontalInset * 2) + 6
         }
-        panel.setContentSize(NSSize(width: width, height: height))
 
         let screen = NSScreen.main ?? NSScreen.screens.first
-        guard let frame = screen?.visibleFrame else { return }
-        panel.setFrameOrigin(NSPoint(x: frame.midX - width / 2, y: frame.minY + 96))
+        guard let screenFrame = screen?.visibleFrame else {
+            panel.setContentSize(NSSize(width: width, height: height))
+            return
+        }
+        // The panel is borderless, so the frame and the content rect coincide.
+        let target = NSRect(
+            x: screenFrame.midX - width / 2,
+            y: screenFrame.minY + 96,
+            width: width,
+            height: height
+        )
+
+        if animated, panel.frame != target {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.16
+                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                panel.animator().setFrame(target, display: true)
+            }
+        } else {
+            panel.setFrame(target, display: true)
+        }
     }
 
     static func transcriptHeight(_ text: String, width: CGFloat) -> CGFloat {
@@ -310,12 +369,38 @@ public final class HUDController {
         indicator?.layer?.backgroundColor = color.cgColor
     }
 
+    /// A slow opacity pulse on the dot while recording — the one state where "is it
+    /// actually listening?" matters and a static dot reads as frozen.
+    private func setIndicatorPulsing(_ pulsing: Bool) {
+        guard let layer = indicator?.layer else { return }
+        if pulsing {
+            guard layer.animation(forKey: Self.pulseAnimationKey) == nil else { return }
+            let pulse = CABasicAnimation(keyPath: "opacity")
+            pulse.fromValue = 1.0
+            pulse.toValue = 0.35
+            pulse.duration = 0.7
+            pulse.autoreverses = true
+            pulse.repeatCount = .infinity
+            pulse.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            layer.add(pulse, forKey: Self.pulseAnimationKey)
+        } else {
+            layer.removeAnimation(forKey: Self.pulseAnimationKey)
+        }
+    }
+
+    private static let pulseAnimationKey = "lvf.pulse"
+
     private func setLevel(_ level: Float) {
         guard let constraint = levelWidthConstraint, let track = levelBar?.superview else { return }
         let clamped = CGFloat(max(0, min(1, level)))
         // Compress the range: speech rarely peaks above ~0.5, so a linear bar barely moves.
         let scaled = min(1, sqrt(clamped) * 1.35)
-        constraint.constant = track.bounds.width * scaled
+        // Levels arrive at ~23 Hz (2048-sample buffers); a short ease between readings
+        // turns the stepping into a glide.
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.09
+            constraint.animator().constant = track.bounds.width * scaled
+        }
     }
 
     private func elapsedDetail() -> String {

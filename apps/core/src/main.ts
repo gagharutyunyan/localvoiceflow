@@ -129,6 +129,14 @@ async function main(): Promise<void> {
 
   const url = dashboardUrl(host, port);
   logger.info("core listening", { host, port, webDir: existsSync(webDir) ? webDir : "(not built)" });
+
+  // Prime the active corrector in the background: health() runs the executable lookup
+  // and the once-per-process flag probes now, so the first dictation does not pay the
+  // ~1 s they cost. Quota-free — probes never reach the network model.
+  void providers
+    .get(settings.correction.provider)
+    ?.health()
+    .catch(() => {});
   // Printed to stdout, not the log file: the token belongs in the terminal the user is
   // looking at, not in a file that gets shipped around.
   process.stdout.write(`\nLocalVoiceFlow dashboard: ${url}\n\n`);

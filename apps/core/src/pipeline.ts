@@ -92,6 +92,7 @@ export class Pipeline {
     const log = logger.child({ dictationId: id });
     let audioPath: string | undefined;
     let recordCreated = false;
+    let prewarmedProvider: TextCorrectionProvider | undefined;
 
     try {
       events.publish({
@@ -128,6 +129,18 @@ export class Pipeline {
       // --- 2. Transcribe ---------------------------------------------------
       const terms = db.listEnabledTerms();
       const initialPrompt = buildSttInitialPrompt(terms, settings.stt.glossaryPromptLimit);
+
+      // Start the corrector CLI now so its startup overlaps transcription. The child
+      // blocks on stdin — nothing is sent and no quota is spent unless the correction
+      // step consumes it; the finally below reaps it on every other path.
+      prewarmedProvider = this.#deps.providers.get(settings.correction.provider);
+      prewarmedProvider?.prewarm?.({
+        model: settings.correction.model,
+        effort: settings.correction.effort,
+        timeoutMs: settings.correction.timeoutMs,
+        systemPrompt: this.#deps.loadSystemPrompt(),
+        disableThinking: settings.correction.disableThinking,
+      });
 
       events.publish({
         type: "pipeline",
@@ -368,6 +381,10 @@ export class Pipeline {
       if (audioPath) {
         rmSync(audioPath, { force: true });
       }
+      // Reap a prewarmed CLI child the correction step never consumed (no speech, too
+      // short, cancel, STT failure). A parallel dictation's fresh prewarm can be caught
+      // by this too — that run then simply cold-spawns; never incorrect, only unwarmed.
+      prewarmedProvider?.cancelPrewarm?.();
     }
   }
 

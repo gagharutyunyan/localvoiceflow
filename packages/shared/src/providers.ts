@@ -108,6 +108,19 @@ export interface TextCorrectionProvider {
     config: ProviderConfig,
     signal?: AbortSignal,
   ): Promise<CorrectionResult>;
+  /**
+   * Optional latency optimisation: start the CLI process now, before the transcript
+   * exists, so its startup overlaps transcription. The process reads stdin before it can
+   * issue any request, so nothing is sent and no quota is spent until a `correct()` call
+   * with the same config consumes it. Best-effort and fire-and-forget: failures here
+   * must surface nothing — the real call spawns its own process and reports normally.
+   */
+  prewarm?(config: ProviderConfig): void;
+  /**
+   * Kills a prewarmed process that was never consumed (transcription failed, cancel,
+   * empty capture). Safe to call without a prior prewarm and after consumption.
+   */
+  cancelPrewarm?(): void;
 }
 
 // ---------------------------------------------------------------------------

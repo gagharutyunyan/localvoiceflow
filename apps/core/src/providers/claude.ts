@@ -12,7 +12,7 @@ import {
   type ProviderHealth,
   type TextCorrectionProvider,
 } from "@lvf/shared";
-import { detectApiKeyEnv, runCli, subscriptionOnlyEnv } from "./spawn.js";
+import { detectApiKeyEnv, runCli, startCli, subscriptionOnlyEnv, type CliHandle, type RunResult } from "./spawn.js";
 import { classifyCliFailure, summarizeStderr } from "./errors.js";
 import { resolveExecutable } from "./which.js";
 
@@ -149,12 +149,29 @@ export function sanitizeClaudeMetadata(meta: ClaudeJsonResult): Record<string, u
   return out;
 }
 
+/** A CLI child spawned ahead of its payload, plus everything needed to adopt or kill it. */
+interface PrewarmedCli {
+  handle: CliHandle;
+  /** Everything that shaped the child's argv/env; a mismatch means "do not consume". */
+  key: string;
+  /** Holds the system prompt the child was pointed at; deleted with the slot. */
+  promptDir: string;
+  /** Backstop: a prewarmed child nobody consumed must not linger forever. */
+  expiry: NodeJS.Timeout;
+}
+
+/** How long an unconsumed prewarmed child may wait for its transcript. */
+const PREWARM_TTL_MS = 120_000;
+
 export class ClaudeCliProvider implements TextCorrectionProvider {
   readonly id = "claude-cli" as const;
 
   readonly #workDir: string;
   #cachedHealth: { at: number; value: ProviderHealth } | undefined;
   #missingFlags: Promise<string[]> | undefined;
+  #prewarmed: PrewarmedCli | undefined;
+  /** Bumped by cancelPrewarm() so an async prewarm still in flight knows to self-destruct. */
+  #prewarmGen = 0;
 
   constructor(options: { workDir: string }) {
     this.#workDir = options.workDir;
@@ -250,6 +267,117 @@ export class ClaudeCliProvider implements TextCorrectionProvider {
     return this.#missingFlags;
   }
 
+  /** Everything that shapes a child's argv and env; prewarm/consume must agree on it. */
+  static #prewarmKey(config: ProviderConfig): string {
+    return [config.model, config.effort, String(config.disableThinking), config.systemPrompt].join("\u0000");
+  }
+
+  /** The argv/env pair for one correction call; shared by the warm and cold paths. */
+  #buildInvocation(
+    config: ProviderConfig,
+    promptFile: string,
+    missingFlags: string[],
+  ): { args: string[]; env: NodeJS.ProcessEnv } {
+    const supported = new Set(
+      [...REQUIRED_FLAGS, ...HIDDEN_FLAGS].filter((flag) => !missingFlags.includes(flag)),
+    );
+    const args = buildClaudeArgs({
+      model: config.model,
+      effort: config.effort,
+      systemPromptFile: promptFile,
+      supportedFlags: supported,
+    });
+    const extraEnv: Record<string, string> = {
+      // Measured: removes ~4.5 s of thinking on a short phrase with no quality loss.
+      ...(config.disableThinking ? { MAX_THINKING_TOKENS: "0" } : {}),
+      DISABLE_AUTOUPDATER: "1",
+      DISABLE_TELEMETRY: "1",
+      DISABLE_ERROR_REPORTING: "1",
+      DISABLE_NON_ESSENTIAL_MODEL_CALLS: "1",
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
+    };
+    return { args, env: subscriptionOnlyEnv(process.env, extraEnv) };
+  }
+
+  /**
+   * Spawns the CLI now so its ~0.4 s startup overlaps transcription. The child blocks
+   * reading stdin, so no request leaves and no quota is spent until correct() feeds it.
+   * Best-effort: any failure here just means the real call spawns its own child.
+   */
+  prewarm(config: ProviderConfig): void {
+    const key = ClaudeCliProvider.#prewarmKey(config);
+    if (this.#prewarmed?.handle.alive && this.#prewarmed.key === key) return;
+    this.cancelPrewarm();
+    const gen = this.#prewarmGen;
+
+    void (async () => {
+      const cliPath = await resolveExecutable("claude");
+      if (!cliPath) return;
+      const missingFlags = await this.#missingFlagsOnce(cliPath, subscriptionOnlyEnv(process.env));
+
+      const promptDir = mkdtempSync(join(tmpdir(), "lvf-claude-"));
+      try {
+        const promptFile = join(promptDir, "system-prompt.md");
+        writeFileSync(promptFile, config.systemPrompt, { encoding: "utf8", mode: 0o600 });
+        const invocation = this.#buildInvocation(config, promptFile, missingFlags);
+        const handle = startCli(cliPath, {
+          args: invocation.args,
+          cwd: this.#workDir,
+          env: invocation.env,
+        });
+
+        const slot: PrewarmedCli = {
+          handle,
+          key,
+          promptDir,
+          expiry: setTimeout(() => {
+            if (this.#prewarmed === slot) this.cancelPrewarm();
+          }, PREWARM_TTL_MS),
+        };
+        slot.expiry.unref();
+
+        // cancelPrewarm() may have run while the awaits above were in flight, or a
+        // competing prewarm may have landed first; a child nobody tracks must die now.
+        if (gen !== this.#prewarmGen || this.#prewarmed !== undefined) {
+          clearTimeout(slot.expiry);
+          handle.dispose();
+          rmSync(promptDir, { recursive: true, force: true });
+          return;
+        }
+        this.#prewarmed = slot;
+      } catch {
+        rmSync(promptDir, { recursive: true, force: true });
+      }
+    })().catch(() => {});
+  }
+
+  cancelPrewarm(): void {
+    this.#prewarmGen += 1;
+    const slot = this.#prewarmed;
+    if (!slot) return;
+    this.#prewarmed = undefined;
+    clearTimeout(slot.expiry);
+    slot.handle.dispose();
+    rmSync(slot.promptDir, { recursive: true, force: true });
+  }
+
+  /**
+   * Hands over the prewarmed child when it is still alive and was built for exactly
+   * this config; otherwise kills it, because a stale child would apply a stale prompt.
+   * The caller owns the returned slot, its promptDir included.
+   */
+  #takePrewarmed(config: ProviderConfig): PrewarmedCli | undefined {
+    const slot = this.#prewarmed;
+    if (!slot) return undefined;
+    if (!slot.handle.alive || slot.key !== ClaudeCliProvider.#prewarmKey(config)) {
+      this.cancelPrewarm();
+      return undefined;
+    }
+    this.#prewarmed = undefined;
+    clearTimeout(slot.expiry);
+    return slot;
+  }
+
   /**
    * Probes flag support by running `claude <flag> --version`: commander rejects an
    * unknown option before doing any work, so this costs nothing and touches no quota.
@@ -295,44 +423,42 @@ export class ClaudeCliProvider implements TextCorrectionProvider {
     // every dictation. Authentication is not pre-checked either — a signed-out CLI
     // fails the real call and classifyCliFailure maps that to llm_not_authenticated.
     const apiKeyEnvPresent = detectApiKeyEnv();
-    const missingFlags = await this.#missingFlagsOnce(cliPath, subscriptionOnlyEnv(process.env));
 
-    const promptDir = mkdtempSync(join(tmpdir(), "lvf-claude-"));
-    const promptFile = join(promptDir, "system-prompt.md");
-    writeFileSync(promptFile, config.systemPrompt, { encoding: "utf8", mode: 0o600 });
+    const payload = serializeCorrectionPayload(input);
 
-    try {
-      const supported = new Set(
-        [...REQUIRED_FLAGS, ...HIDDEN_FLAGS].filter((flag) => !missingFlags.includes(flag)),
-      );
-      const args = buildClaudeArgs({
-        model: config.model,
-        effort: config.effort,
-        systemPromptFile: promptFile,
-        supportedFlags: supported,
-      });
+    // A prewarmed child already carries this exact config (argv, env and prompt file);
+    // adopting it skips the CLI's ~0.4 s startup. Its promptDir becomes ours to delete.
+    const consumed = this.#takePrewarmed(config);
 
-      const extraEnv: Record<string, string> = {
-        // Measured: removes ~4.5 s of thinking on a short phrase with no quality loss.
-        ...(config.disableThinking ? { MAX_THINKING_TOKENS: "0" } : {}),
-        DISABLE_AUTOUPDATER: "1",
-        DISABLE_TELEMETRY: "1",
-        DISABLE_ERROR_REPORTING: "1",
-        DISABLE_NON_ESSENTIAL_MODEL_CALLS: "1",
-        CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
-      };
+    let promptDir: string;
+    let runPromise: Promise<RunResult>;
+    const startedAt = process.hrtime.bigint();
 
-      const payload = serializeCorrectionPayload(input);
-      const startedAt = process.hrtime.bigint();
-
-      const run = await runCli(cliPath, {
-        args,
-        cwd: this.#workDir,
-        env: subscriptionOnlyEnv(process.env, extraEnv),
+    if (consumed) {
+      promptDir = consumed.promptDir;
+      runPromise = consumed.handle.feed({
         stdin: payload.text,
         timeoutMs: config.timeoutMs,
         ...(signal ? { signal } : {}),
       });
+    } else {
+      const missingFlags = await this.#missingFlagsOnce(cliPath, subscriptionOnlyEnv(process.env));
+      promptDir = mkdtempSync(join(tmpdir(), "lvf-claude-"));
+      const promptFile = join(promptDir, "system-prompt.md");
+      writeFileSync(promptFile, config.systemPrompt, { encoding: "utf8", mode: 0o600 });
+      const invocation = this.#buildInvocation(config, promptFile, missingFlags);
+      runPromise = runCli(cliPath, {
+        args: invocation.args,
+        cwd: this.#workDir,
+        env: invocation.env,
+        stdin: payload.text,
+        timeoutMs: config.timeoutMs,
+        ...(signal ? { signal } : {}),
+      });
+    }
+
+    try {
+      const run = await runPromise;
 
       const latencyMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
 

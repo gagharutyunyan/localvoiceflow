@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import type { CorrectionInput, ProviderConfig } from "@lvf/shared";
 import { ClaudeCliProvider, buildClaudeArgs, parseClaudeOutput, sanitizeClaudeMetadata } from "../dist/providers/claude.js";
 import { CodexCliProvider, buildCodexArgs, parseCodexLoginStatus, parseCodexOutput } from "../dist/providers/codex.js";
-import { API_KEY_ENV_VARS, detectApiKeyEnv, runCli, subscriptionOnlyEnv } from "../dist/providers/spawn.js";
+import { API_KEY_ENV_VARS, detectApiKeyEnv, runCli, startCli, subscriptionOnlyEnv } from "../dist/providers/spawn.js";
 import { classifyCliFailure, summarizeStderr } from "../dist/providers/errors.js";
 import { clearExecutableCache } from "../dist/providers/which.js";
 import { containsTerm, leaksTerm } from "../dist/fixture-match.js";
@@ -454,6 +454,48 @@ describe("runCli", () => {
   );
 });
 
+describe("startCli", () => {
+  test("the child waits for feed(): stdin arrives late, output still complete", async () => {
+    const handle = startCli("/bin/cat", { args: [], cwd: process.cwd(), env: {} });
+    assert.equal(handle.alive, true);
+    // The child sits blocked on stdin during this window — exactly the prewarm shape.
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(handle.alive, true, "an unfed cat must still be running");
+    const result = await handle.feed({ stdin: "поздний ввод", timeoutMs: 5000 });
+    assert.equal(result.code, 0);
+    assert.equal(result.stdout, "поздний ввод");
+  });
+
+  test("dispose() kills an unconsumed child promptly", async () => {
+    const handle = startCli("/bin/sleep", { args: ["10"], cwd: process.cwd(), env: {} });
+    const startedAt = Date.now();
+    handle.dispose();
+    // feed() on a disposed child just returns the settled result.
+    const result = await handle.feed({ timeoutMs: 5000 });
+    assert.notEqual(result.code, 0, "the child must not have exited normally");
+    assert.ok(Date.now() - startedAt < 3000, "disposal must be prompt");
+    assert.equal(handle.alive, false);
+  });
+
+  test("a child that dies before feed() reports its exit, not a hang", async () => {
+    const handle = startCli("/usr/bin/false", { args: [], cwd: process.cwd(), env: {} });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.equal(handle.alive, false);
+    const result = await handle.feed({ stdin: "никому", timeoutMs: 5000 });
+    assert.equal(result.code, 1);
+  });
+
+  test("an already-aborted signal at feed() kills the child and rejects", async () => {
+    const handle = startCli("/bin/cat", { args: [], cwd: process.cwd(), env: {} });
+    const controller = new AbortController();
+    controller.abort();
+    await assert.rejects(
+      handle.feed({ stdin: "не должно уйти", timeoutMs: 5000, signal: controller.signal }),
+      (error: Error & { code?: string }) => error.code === "cancelled",
+    );
+  });
+});
+
 describe("correct() hot path spawns no health probes", () => {
   const config: ProviderConfig = {
     model: "test-model",
@@ -570,6 +612,110 @@ describe("correct() hot path spawns no health probes", () => {
         lines.filter((line) => line.startsWith("-p")).length,
         0,
         "the real CLI call must never be spawned after the abort",
+      );
+    });
+  });
+
+  test("claude: a prewarmed child is consumed instead of a fresh spawn", async () => {
+    const script = [
+      "#!/bin/sh",
+      'printf \'%s\\n\' "$*" >> "__LOG__"',
+      'case "$*" in',
+      '  *--version*) echo "9.9.9 (fake)"; exit 0;;',
+      "esac",
+      "cat > /dev/null",
+      `printf '%s' '{"is_error":false,"structured_output":{"text":"ГОТОВО"}}'`,
+      "",
+    ].join("\n");
+
+    const realCalls = (log: string): string[] =>
+      (existsSync(log) ? readFileSync(log, "utf8").trim().split("\n") : []).filter((line) =>
+        line.startsWith("-p"),
+      );
+    const waitForSpawn = async (log: string): Promise<void> => {
+      const deadline = Date.now() + 3000;
+      while (Date.now() < deadline) {
+        if (realCalls(log).length > 0) {
+          // The slot is assigned in the same tick as the spawn; the child's shell wrote
+          // the log line strictly later, so a short grace period is enough.
+          await new Promise((resolve) => setTimeout(resolve, 50));
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      assert.fail("the prewarmed child never spawned");
+    };
+
+    await withFakeCli("claude", script, async (dir, log) => {
+      const provider = new ClaudeCliProvider({ workDir: dir });
+
+      provider.prewarm(config);
+      await waitForSpawn(log);
+      assert.equal(realCalls(log).length, 1, "prewarm spawns exactly one real call");
+
+      const result = await provider.correct(input, config);
+      assert.equal(result.finalText, "ГОТОВО");
+      assert.equal(
+        realCalls(log).length,
+        1,
+        "correct() must adopt the prewarmed child, not spawn a second one",
+      );
+
+      // A second dictation without a prewarm cold-spawns as before.
+      const second = await provider.correct(input, config);
+      assert.equal(second.finalText, "ГОТОВО");
+      assert.equal(realCalls(log).length, 2);
+    });
+  });
+
+  test("claude: cancelPrewarm() and a config mismatch both force a fresh spawn", async () => {
+    const script = [
+      "#!/bin/sh",
+      'printf \'%s\\n\' "$*" >> "__LOG__"',
+      'case "$*" in',
+      '  *--version*) echo "9.9.9 (fake)"; exit 0;;',
+      "esac",
+      "cat > /dev/null",
+      `printf '%s' '{"is_error":false,"structured_output":{"text":"ГОТОВО"}}'`,
+      "",
+    ].join("\n");
+
+    const realCalls = (log: string): string[] =>
+      (existsSync(log) ? readFileSync(log, "utf8").trim().split("\n") : []).filter((line) =>
+        line.startsWith("-p"),
+      );
+    const waitForSpawnCount = async (log: string, count: number): Promise<void> => {
+      const deadline = Date.now() + 3000;
+      while (Date.now() < deadline) {
+        if (realCalls(log).length >= count) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      assert.fail(`the prewarmed child #${count} never spawned`);
+    };
+
+    await withFakeCli("claude", script, async (dir, log) => {
+      const provider = new ClaudeCliProvider({ workDir: dir });
+
+      // Cancelled prewarm: the child dies unconsumed, correct() spawns its own.
+      provider.prewarm(config);
+      await waitForSpawnCount(log, 1);
+      provider.cancelPrewarm();
+      const first = await provider.correct(input, config);
+      assert.equal(first.finalText, "ГОТОВО");
+      assert.equal(realCalls(log).length, 2, "a cancelled prewarm must not be consumed");
+
+      // Mismatched prewarm: a stale child must never serve a different config.
+      provider.prewarm(config);
+      await waitForSpawnCount(log, 3);
+      const second = await provider.correct(input, { ...config, model: "other-model" });
+      assert.equal(second.finalText, "ГОТОВО");
+      assert.equal(realCalls(log).length, 4, "a mismatched prewarm must not be consumed");
+      assert.ok(
+        realCalls(log)[3]!.includes("other-model"),
+        "the fresh spawn must carry the requested model",
       );
     });
   });

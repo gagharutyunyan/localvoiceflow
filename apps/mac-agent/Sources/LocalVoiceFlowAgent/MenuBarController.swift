@@ -57,6 +57,8 @@ public protocol MenuBarDelegate: AnyObject {
     /// Refresh only — the menu opens constantly, so this must never prompt.
     func menuBarWillOpen()
     func menuBarDidRequestPermissionCheck()
+    /// Opens the window that walks through the three macOS grants.
+    func menuBarDidRequestOnboarding()
     func menuBarDidRequestRestart()
     func menuBarDidRequestQuit()
     func menuBarDidRequestOpenSettingsPane(_ pane: Permissions.SettingsPane)
@@ -147,6 +149,10 @@ public final class MenuBarController: NSObject, NSMenuDelegate {
         menu.addItem(.separator())
         menu.addItem(permissionsSubmenuItem())
 
+        let setup = NSMenuItem(title: "Настроить разрешения…", action: #selector(openOnboarding), keyEquivalent: "")
+        setup.target = self
+        menu.addItem(setup)
+
         let check = NSMenuItem(title: "Проверить разрешения", action: #selector(checkPermissions), keyEquivalent: "")
         check.target = self
         menu.addItem(check)
@@ -190,6 +196,10 @@ public final class MenuBarController: NSObject, NSMenuDelegate {
 
     @objc private func toggleService() { delegate?.menuBarDidToggleService() }
     @objc private func openDashboard() { delegate?.menuBarDidRequestDashboard() }
+    @objc private func openOnboarding() {
+        delegate?.menuBarDidRequestOnboarding()
+    }
+
     @objc private func checkPermissions() { delegate?.menuBarDidRequestPermissionCheck() }
     @objc private func restart() { delegate?.menuBarDidRequestRestart() }
     @objc private func quit() { delegate?.menuBarDidRequestQuit() }

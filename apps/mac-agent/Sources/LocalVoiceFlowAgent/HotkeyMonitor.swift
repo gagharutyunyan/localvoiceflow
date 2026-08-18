@@ -186,6 +186,13 @@ public final class HotkeyMonitor {
     /// (Re)registers the fallback chord. Passing nil or an unparsable string unregisters it.
     @discardableResult
     public func setFallbackHotkey(_ raw: String?) -> Bool {
+        // Startup calls this twice — once from `startService`, once when the config arrives from
+        // core — and re-registering leaves a window in which the chord is dead. Same shortcut
+        // that is already live means there is nothing to do.
+        if let raw, !raw.isEmpty, let spec = HotkeySpec.parse(raw), spec == hotKeySpec, hotKeyRef != nil {
+            return true
+        }
+
         unregisterFallback()
         guard let raw, !raw.isEmpty, let spec = HotkeySpec.parse(raw) else {
             if let raw, !raw.isEmpty {

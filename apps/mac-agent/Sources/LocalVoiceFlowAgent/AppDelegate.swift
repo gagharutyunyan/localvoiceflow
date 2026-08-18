@@ -14,6 +14,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, MenuBarDelegate
     private let hud = HUDController()
     private let inserter = TextInserter()
     private let machine = DictationStateMachine()
+    private let onboarding = OnboardingController()
 
     private var menuBar: MenuBarController?
     private var config = AgentConfig()
@@ -61,6 +62,15 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, MenuBarDelegate
 
         machine.config = config.dictationConfig
         hud.isEnabled = config.hudEnabled
+
+        onboarding.onRestartRequested = { [weak self] in
+            self?.menuBarDidRequestRestart()
+        }
+        // Nothing works without the three grants, so the first launch that lacks any of them
+        // opens the window instead of leaving a menu-bar icon that quietly does nothing.
+        if OnboardingController.isNeeded {
+            onboarding.show()
+        }
 
         hotkeys.onEvent = { [weak self] event in
             MainActor.assumeIsolated { self?.handle(event) }
@@ -503,8 +513,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, MenuBarDelegate
         if outcome.isRawFallback == true {
             lastError = "LLM недоступен, вставлен сырой транскрипт"
         }
+        let note = result.note.map { " [\($0)]" } ?? ""
         AgentLog.info(
-            "dictation \(outcome.id) delivered via \(result.method) (\(text.count) chars, total \(Int(outcome.totalLatencyMs ?? 0)) ms)"
+            "dictation \(outcome.id) delivered via \(result.method)\(note) (\(text.count) chars, total \(Int(outcome.totalLatencyMs ?? 0)) ms)"
         )
         refreshMenu()
     }
@@ -580,6 +591,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, MenuBarDelegate
         }
         if previous != permissions { reportStatus() }
         refreshMenu()
+    }
+
+    public func menuBarDidRequestOnboarding() {
+        onboarding.show()
     }
 
     public func menuBarDidRequestOpenSettingsPane(_ pane: Permissions.SettingsPane) {

@@ -75,6 +75,61 @@ public enum InsertionPolicy {
             || role == (kAXTextAreaRole as String)
             || role == (kAXComboBoxRole as String)
     }
+
+    /// Applications where an Accessibility write reaches the wrong place.
+    ///
+    /// A terminal emulator exposes its screen as an `AXTextArea`, but the screen is *output*: the
+    /// characters the program reads come from the pty, not from the AX model. Writing there is
+    /// accepted by the widget and then lost on the next redraw, or leaves the emulator's input
+    /// state out of sync — the text shows up but Return does nothing. JetBrains IDEs are the same
+    /// story for their whole window: the Swing accessibility bridge reports writable text areas
+    /// (editor, terminal) that do not feed the real document model.
+    ///
+    /// For these, clipboard + ⌘V is the only path that behaves like the user typing: the emulator
+    /// turns it into a bracketed paste and the program on the other end of the pty actually sees it.
+    public static func prefersPasteOverAccessibility(bundleId: String?) -> Bool {
+        guard let bundleId, !bundleId.isEmpty else { return false }
+        let id = bundleId.lowercased()
+
+        // Every JetBrains IDE (WebStorm, IntelliJ, PyCharm, …) and Android Studio: Swing AX.
+        if id.hasPrefix("com.jetbrains.") || id.hasPrefix("com.google.android.studio") { return true }
+
+        return pasteOnlyBundleIds.contains(id)
+    }
+
+    /// Terminal emulators and editors whose embedded terminal shares the app's bundle id.
+    private static let pasteOnlyBundleIds: Set<String> = [
+        "com.apple.terminal",
+        "com.googlecode.iterm2",
+        "dev.warp.warp-stable",
+        "dev.warp.warp",
+        "com.github.wez.wezterm",
+        "net.kovidgoyal.kitty",
+        "io.alacritty",
+        "org.alacritty",
+        "com.mitchellh.ghostty",
+        "co.zeit.hyper",
+        "org.tabby",
+        "com.microsoft.vscode",
+        "com.microsoft.vscodeinsiders",
+        "com.visualstudio.code.oss",
+        "com.todesktop.230313mzl4w4u92", // Cursor
+        "com.exafunction.windsurf",
+        "dev.zed.zed",
+        "dev.zed.zed-preview",
+    ]
+
+    /// Last line of defence for terminals inside applications we do not know by bundle id: the
+    /// focused element describes itself as a terminal or a console.
+    public static func looksLikeTerminal(roleDescription: String?, description: String?, identifier: String?) -> Bool {
+        for value in [roleDescription, description, identifier] {
+            guard let value = value?.lowercased(), !value.isEmpty else { continue }
+            if value.contains("terminal") || value.contains("console") || value.contains("shell") {
+                return true
+            }
+        }
+        return false
+    }
 }
 
 /// Puts the finished text where the user was typing.
@@ -127,6 +182,14 @@ public final class TextInserter {
         }
 
         if plan == .insertIntoOriginalTarget || plan == .insertIntoCurrentApp {
+            // ⌘V goes to whoever holds the keyboard focus right now, so the app that decides how
+            // the text must be delivered is the frontmost one, not the one we recorded against.
+            let destination = current?.bundleId ?? target?.bundleId
+            if InsertionPolicy.prefersPasteOverAccessibility(bundleId: destination) {
+                pasteViaClipboard(text: text, options: options)
+                return InsertionOutcome(method: .paste, message: "Вставлено", note: "ax-unreliable-app")
+            }
+
             switch insertViaAccessibility(text: text) {
             case .inserted:
                 return InsertionOutcome(method: .accessibility, message: "Вставлено", note: nil)
@@ -172,6 +235,15 @@ public final class TextInserter {
         if subrole == (kAXSecureTextFieldSubrole as String) { return .secureField }
         guard InsertionPolicy.isWritableTextRole(role: role, subrole: subrole) else {
             return .unsupported("role-not-writable")
+        }
+
+        // A terminal inside an app we do not know by bundle id still reports a writable text area.
+        if InsertionPolicy.looksLikeTerminal(
+            roleDescription: copyStringAttribute(element, kAXRoleDescriptionAttribute as CFString),
+            description: copyStringAttribute(element, kAXDescriptionAttribute as CFString),
+            identifier: copyStringAttribute(element, kAXIdentifierAttribute as CFString)
+        ) {
+            return .unsupported("terminal-like-element")
         }
 
         // Preferred: replace the selection, which is exactly "type here" semantics and leaves the
@@ -264,6 +336,12 @@ public final class TextInserter {
         pasteboard.setString(text, forType: .string)
     }
 
+    /// Milliseconds between writing the pasteboard and the ⌘V that reads it. Java and Electron
+    /// apps pick the pasteboard up through a bridge that lags a frame behind the write.
+    private static let pasteboardSettleMs: UInt32 = 40
+    /// Milliseconds between the individual synthetic key events.
+    private static let keyEventGapMs: UInt32 = 8
+
     private func pasteViaClipboard(text: String, options: InsertionOptions) {
         let previous = options.restoreClipboard ? snapshotPasteboard() : nil
         pasteboard.clearContents()
@@ -273,7 +351,10 @@ public final class TextInserter {
         postCommandV()
 
         guard let previous, options.restoreClipboard else { return }
-        let delay = Double(max(50, options.clipboardRestoreDelayMs)) / 1000
+        // The keystroke itself is posted asynchronously, so the restore has to clear both that
+        // sequence and the target app's own paste handling before it puts the old value back.
+        let keystrokeMs = Double(Self.pasteboardSettleMs + 3 * Self.keyEventGapMs)
+        let delay = (keystrokeMs + Double(max(50, options.clipboardRestoreDelayMs))) / 1000
         let board = pasteboard
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
@@ -291,24 +372,48 @@ public final class TextInserter {
     }
 
     /// Synthesises ⌘V. Requires Accessibility; the caller has already checked that.
+    ///
+    /// Three details matter for apps that are not plain Cocoa:
+    ///
+    /// * `.privateState` — a `.combinedSessionState` source merges the modifiers the user is
+    ///   physically holding into our event, so a still-pressed push-to-talk ⌃⌥ turns ⌘V into
+    ///   ⌃⌥⌘V and nothing pastes.
+    /// * The ⌘ press is posted as its own `flagsChanged` event. Swing (JetBrains) and Chromium
+    ///   track modifier state from those events rather than from the flags on the key event, and
+    ///   without it they see a bare "v" and type the letter into the terminal.
+    /// * `.cghidEventTap` with small gaps — the events enter at the same point real hardware does,
+    ///   which is what non-native key handling expects.
     private func postCommandV() {
-        let source = CGEventSource(stateID: .combinedSessionState)
-        // Suppress our own synthetic keystrokes from re-entering local key handling.
-        source?.setLocalEventsFilterDuringSuppressionState(
-            [.permitLocalMouseEvents, .permitSystemDefinedEvents],
-            state: .eventSuppressionStateSuppressionInterval
-        )
-        let vKey = CGKeyCode(kVK_ANSI_V)
-        guard let down = CGEvent(keyboardEventSource: source, virtualKey: vKey, keyDown: true),
-              let up = CGEvent(keyboardEventSource: source, virtualKey: vKey, keyDown: false)
-        else {
-            AgentLog.error("failed to create ⌘V events")
-            return
+        DispatchQueue.global(qos: .userInitiated).async {
+            let source = CGEventSource(stateID: .privateState)
+            // Suppress our own synthetic keystrokes from re-entering local key handling.
+            source?.setLocalEventsFilterDuringSuppressionState(
+                [.permitLocalMouseEvents, .permitSystemDefinedEvents],
+                state: .eventSuppressionStateSuppressionInterval
+            )
+            let vKey = CGKeyCode(kVK_ANSI_V)
+            let commandKey = CGKeyCode(kVK_Command)
+            guard let commandDown = CGEvent(keyboardEventSource: source, virtualKey: commandKey, keyDown: true),
+                  let down = CGEvent(keyboardEventSource: source, virtualKey: vKey, keyDown: true),
+                  let up = CGEvent(keyboardEventSource: source, virtualKey: vKey, keyDown: false),
+                  let commandUp = CGEvent(keyboardEventSource: source, virtualKey: commandKey, keyDown: false)
+            else {
+                AgentLog.error("failed to create ⌘V events")
+                return
+            }
+            commandDown.type = .flagsChanged
+            commandDown.flags = .maskCommand
+            down.flags = .maskCommand
+            up.flags = .maskCommand
+            commandUp.type = .flagsChanged
+            commandUp.flags = []
+
+            usleep(Self.pasteboardSettleMs * 1000)
+            for event in [commandDown, down, up, commandUp] {
+                event.post(tap: .cghidEventTap)
+                usleep(Self.keyEventGapMs * 1000)
+            }
         }
-        down.flags = .maskCommand
-        up.flags = .maskCommand
-        down.post(tap: .cgAnnotatedSessionEventTap)
-        up.post(tap: .cgAnnotatedSessionEventTap)
     }
 
     // MARK: - Secure input

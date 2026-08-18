@@ -118,6 +118,49 @@ final class ClipboardDecisionTests: XCTestCase {
         XCTAssertFalse(InsertionPolicy.isWritableTextRole(role: nil, subrole: nil))
     }
 
+    // MARK: - Apps where Accessibility writes go to the wrong place
+
+    func testTerminalEmulatorsGetThePastePath() {
+        XCTAssertTrue(InsertionPolicy.prefersPasteOverAccessibility(bundleId: "com.apple.Terminal"))
+        XCTAssertTrue(InsertionPolicy.prefersPasteOverAccessibility(bundleId: "com.googlecode.iterm2"))
+        XCTAssertTrue(InsertionPolicy.prefersPasteOverAccessibility(bundleId: "com.mitchellh.ghostty"))
+    }
+
+    func testEveryJetBrainsIdeGetsThePastePath() {
+        // Claude Code running in the WebStorm terminal is the case that started this: an AX write
+        // is accepted by the Swing text area and never reaches the pty.
+        XCTAssertTrue(InsertionPolicy.prefersPasteOverAccessibility(bundleId: "com.jetbrains.WebStorm"))
+        XCTAssertTrue(InsertionPolicy.prefersPasteOverAccessibility(bundleId: "com.jetbrains.pycharm"))
+    }
+
+    func testEditorsWithAnEmbeddedTerminalGetThePastePath() {
+        XCTAssertTrue(InsertionPolicy.prefersPasteOverAccessibility(bundleId: "com.microsoft.VSCode"))
+        XCTAssertTrue(InsertionPolicy.prefersPasteOverAccessibility(bundleId: "com.todesktop.230313mzl4w4u92"))
+    }
+
+    func testOrdinaryAppsKeepTheAccessibilityPath() {
+        XCTAssertFalse(InsertionPolicy.prefersPasteOverAccessibility(bundleId: "com.apple.Notes"))
+        XCTAssertFalse(InsertionPolicy.prefersPasteOverAccessibility(bundleId: "ru.keepcoder.Telegram"))
+        XCTAssertFalse(InsertionPolicy.prefersPasteOverAccessibility(bundleId: nil))
+        XCTAssertFalse(InsertionPolicy.prefersPasteOverAccessibility(bundleId: ""))
+    }
+
+    func testTerminalDetectionFallsBackToTheElementDescription() {
+        XCTAssertTrue(
+            InsertionPolicy.looksLikeTerminal(roleDescription: "terminal", description: nil, identifier: nil)
+        )
+        XCTAssertTrue(
+            InsertionPolicy.looksLikeTerminal(roleDescription: nil, description: "Terminal output", identifier: nil)
+        )
+        XCTAssertTrue(
+            InsertionPolicy.looksLikeTerminal(roleDescription: nil, description: nil, identifier: "TerminalPanel")
+        )
+        XCTAssertFalse(
+            InsertionPolicy.looksLikeTerminal(roleDescription: "text area", description: "Message", identifier: nil)
+        )
+        XCTAssertFalse(InsertionPolicy.looksLikeTerminal(roleDescription: nil, description: nil, identifier: nil))
+    }
+
     // MARK: - Target app plans
 
     private func snapshot(pid: pid_t, bundleId: String?) -> TargetAppSnapshot {
