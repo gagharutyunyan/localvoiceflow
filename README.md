@@ -36,7 +36,14 @@ API-ключи не нужны и не используются. Приложе�
 
 ## Установка
 
-Три команды, по порядку:
+Сначала получите код:
+
+```bash
+git clone https://github.com/gagharutyunyan/localvoiceflow.git
+cd localvoiceflow
+```
+
+Дальше три команды, по порядку:
 
 ```bash
 make bootstrap     # 1. проверит инструменты, поставит зависимости, создаст Python venv
@@ -246,3 +253,10 @@ make uninstall-purge   # удалить всё, включая историю
 | `llm_cli_missing` | `claude` / `codex` не в `PATH` |
 | `llm_unauthenticated` | войти: `claude` → `/login`, либо `codex login` |
 | Долгая первая диктовка | модель Whisper скачивается один раз (~1.5 ГБ) |
+
+---
+
+## Лицензия
+
+[MIT](LICENSE). Распознавание и вся история остаются на вашем компьютере — лицензия
+касается только кода.

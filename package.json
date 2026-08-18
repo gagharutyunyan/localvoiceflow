@@ -4,6 +4,14 @@
   "private": true,
   "description": "LocalVoiceFlow — local-first voice dictation for macOS (Apple Silicon)",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gagharutyunyan/localvoiceflow.git"
+  },
+  "homepage": "https://github.com/gagharutyunyan/localvoiceflow#readme",
+  "bugs": {
+    "url": "https://github.com/gagharutyunyan/localvoiceflow/issues"
+  },
   "engines": {
     "node": ">=22.5.0"
   },
