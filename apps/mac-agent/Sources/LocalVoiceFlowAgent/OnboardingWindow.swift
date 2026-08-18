@@ -176,28 +176,60 @@ public final class OnboardingController: NSObject, NSWindowDelegate {
     /// One button, two possible outcomes: the system prompt when macOS is still willing to show
     /// it, and the Settings pane when it is not. Trying the prompt first matters — it is the only
     /// path that costs the user a single click, and macOS shows it exactly once per permission.
+    ///
+    /// The request also has a side effect worth keeping: `IOHIDRequestAccess` and
+    /// `AXIsProcessTrustedWithOptions` are what *put the app into the Input Monitoring and
+    /// Accessibility lists*. Merely checking (`IOHIDCheckAccess` / `AXIsProcessTrusted`) never
+    /// creates the row, so a user sent straight to the pane would find nothing to switch on.
     private func request(_ kind: PermissionKind) {
+        // Never both at once. macOS's own dialog already carries an "Open System Settings"
+        // button, so opening the pane alongside it throws two windows at the user for one click.
+        // The pane is for the second press, once macOS has stopped offering the dialog.
+        let askedBefore = hasAskedBefore(kind)
+        markAsked(kind)
+
         switch kind {
         case .microphone:
             Permissions.requestMicrophone { [weak self] state in
                 MainActor.assumeIsolated {
                     guard let self else { return }
-                    if state != .granted { Permissions.openSettings(kind.pane) }
+                    if state != .granted, askedBefore { Permissions.openSettings(kind.pane) }
                     self.refresh()
                 }
             }
 
         case .inputMonitoring:
             let state = Permissions.requestInputMonitoring()
-            if state != .granted { Permissions.openSettings(kind.pane) }
+            if state != .granted, askedBefore { Permissions.openSettings(kind.pane) }
             refresh()
 
         case .accessibility:
-            // The prompt appears only for a process macOS has not asked about yet; for every
-            // later attempt the call returns silently, which is why the pane opens too.
-            let state = Permissions.requestAccessibility(prompt: true)
-            if state != .granted { Permissions.openSettings(kind.pane) }
+            let state = Permissions.requestAccessibility(prompt: !askedBefore)
+            if state != .granted, askedBefore { Permissions.openSettings(kind.pane) }
             refresh()
+        }
+    }
+
+    /// Whether this app has already raised the system dialog for a permission.
+    ///
+    /// This is what removes the "drag the app into the list" step. The row in System Settings is
+    /// created by the *request* — `AXIsProcessTrustedWithOptions(prompt: true)` and
+    /// `IOHIDRequestAccess` — never by checking, and never by opening the pane. So the first
+    /// press always asks, which puts the row there; only afterwards does the button send the
+    /// user to a list that is guaranteed to contain LocalVoiceFlow.
+    private func hasAskedBefore(_ kind: PermissionKind) -> Bool {
+        UserDefaults.standard.bool(forKey: Self.askedKey(kind))
+    }
+
+    private func markAsked(_ kind: PermissionKind) {
+        UserDefaults.standard.set(true, forKey: Self.askedKey(kind))
+    }
+
+    private static func askedKey(_ kind: PermissionKind) -> String {
+        switch kind {
+        case .microphone: return "askedMicrophone"
+        case .inputMonitoring: return "askedInputMonitoring"
+        case .accessibility: return "askedAccessibility"
         }
     }
 

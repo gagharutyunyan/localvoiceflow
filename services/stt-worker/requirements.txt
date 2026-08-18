@@ -8,3 +8,6 @@
 # relying on 0.4.x semantics, where verbose=None is the only fully silent mode.
 mlx-whisper>=0.4.3,<0.5
 numpy>=1.26
+# Local text-correction worker (--role llm). Same upper-bound reasoning as above:
+# mlx-lm moves fast and minor bumps have changed generate() APIs before.
+mlx-lm>=0.31,<0.32

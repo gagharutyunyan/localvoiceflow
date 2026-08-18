@@ -14,7 +14,7 @@ import { detectApiKeyEnv } from "../providers/spawn.js";
 import { resolveExecutable } from "../providers/which.js";
 
 const TestProviderSchema = z.object({
-  provider: z.enum(["claude-cli", "openai-codex-cli", "mock"]),
+  provider: z.enum(["claude-cli", "openai-codex-cli", "local-mlx", "mock"]),
   model: ModelIdSchema,
   effort: z.string().trim().min(1).max(32),
   /** Optional sample; defaults to a short fixed Russian phrase. */
@@ -45,9 +45,10 @@ async function macosVersion(): Promise<string> {
 
 export function registerDiagnosticsRoutes(app: FastifyInstance, ctx: ServerContext): void {
   app.get("/api/diagnostics", async (_request, reply) => {
-    const [claudeHealth, codexHealth, sttHealth, osVersion] = await Promise.all([
+    const [claudeHealth, codexHealth, localHealth, sttHealth, osVersion] = await Promise.all([
       ctx.providers.get("claude-cli")!.health(),
       ctx.providers.get("openai-codex-cli")!.health(),
+      ctx.providers.get("local-mlx")!.health(),
       ctx.stt.health(),
       macosVersion(),
     ]);
@@ -76,6 +77,7 @@ export function registerDiagnosticsRoutes(app: FastifyInstance, ctx: ServerConte
       providers: {
         claude: claudeHealth,
         codex: codexHealth,
+        localMlx: localHealth,
       },
       // Names only — a value is never read out of the environment.
       apiKeyEnvPresent: detectApiKeyEnv(),

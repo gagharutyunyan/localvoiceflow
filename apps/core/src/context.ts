@@ -31,6 +31,7 @@ export interface ServerContextOptions {
   port: number;
   repoRoot: string;
   onSttSettingsChanged: (settings: Settings) => void;
+  onCorrectionSettingsChanged: (settings: Settings) => void;
 }
 
 const UNKNOWN_PERMISSIONS: AgentStatus = {
@@ -56,6 +57,7 @@ export class ServerContext {
   readonly port: number;
   readonly repoRoot: string;
   readonly onSttSettingsChanged: (settings: Settings) => void;
+  readonly onCorrectionSettingsChanged: (settings: Settings) => void;
   readonly startedAt = Date.now();
 
   #agentStatus: AgentStatus & { reportedAt?: string } = { ...UNKNOWN_PERMISSIONS };
@@ -72,6 +74,7 @@ export class ServerContext {
     this.port = options.port;
     this.repoRoot = options.repoRoot;
     this.onSttSettingsChanged = options.onSttSettingsChanged;
+    this.onCorrectionSettingsChanged = options.onCorrectionSettingsChanged;
   }
 
   get agentStatus(): AgentStatus & { reportedAt?: string; agentConnected: boolean } {

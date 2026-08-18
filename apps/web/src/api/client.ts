@@ -5,6 +5,7 @@ import type {
   DictionaryTerm,
   DictionaryTermInput,
   DictionaryTermPatch,
+  ProviderHealth,
   ReprocessRequest,
   Settings,
   SettingsPatch,
@@ -298,7 +299,21 @@ export const api = {
   },
 
   // -- diagnostics --------------------------------------------------------
-  diagnostics: (signal?: AbortSignal) => request<DiagnosticsReport>("/api/diagnostics", { signal }),
+  diagnostics: async (signal?: AbortSignal): Promise<DiagnosticsReport> => {
+    const raw = await request<DiagnosticsReport & { active?: DiagnosticsReport["correction"] }>(
+      "/api/diagnostics",
+      { signal },
+    );
+    // Core reports providers keyed by name ({claude, codex, localMlx}); the report
+    // component iterates a flat list.
+    if (raw.providers && !Array.isArray(raw.providers)) {
+      raw.providers = Object.values(raw.providers as Record<string, ProviderHealth>).filter(
+        (entry): entry is ProviderHealth => Boolean(entry),
+      );
+    }
+    if (!raw.correction && raw.active) raw.correction = raw.active;
+    return raw;
+  },
 
   testProvider: (body: { provider: string; model: string; effort: string }, signal?: AbortSignal) =>
     request<TestProviderResult>("/api/diagnostics/test-provider", { method: "POST", body, signal }),

@@ -21,6 +21,8 @@ const PERMISSION_ACTIONS: Record<string, string> = {
 const PROVIDER_LOGIN_HINT: Record<string, string> = {
   "claude-cli": "Run `claude auth status` in a terminal and sign in with your Claude subscription.",
   "openai-codex-cli": "Run `codex login status` in a terminal and sign in with your ChatGPT account.",
+  "local-mlx":
+    "No sign-in needed — the local model is still loading (first run downloads it) or failed; check the core log.",
 };
 
 function permissionCheck(

@@ -1,7 +1,13 @@
-import { CLAUDE_EFFORTS, CODEX_EFFORTS } from "@lvf/shared";
+import {
+  CLAUDE_EFFORTS,
+  CODEX_EFFORTS,
+  DEFAULT_LOCAL_MLX_MODEL,
+  LOCAL_MLX_MODELS,
+} from "@lvf/shared";
 import type { CommandPreview, ProviderCapability } from "../api/types";
 
 export const PROVIDER_LABELS: Record<string, string> = {
+  "local-mlx": "Local model (on-device, fastest)",
   "claude-cli": "Claude Code subscription",
   "openai-codex-cli": "OpenAI Codex subscription",
   mock: "Mock provider (testing)",
@@ -32,7 +38,31 @@ export function modelsFor(
   capabilities: ProviderCapability[] | null | undefined,
 ): string[] {
   const reported = capabilities?.find((entry) => entry.id === provider);
-  return reported?.models ? [...reported.models] : [];
+  if (reported?.models && reported.models.length > 0) return [...reported.models];
+  if (provider === "local-mlx") return [...LOCAL_MLX_MODELS];
+  return [];
+}
+
+/**
+ * The model to substitute when the user switches providers: a CLI model id
+ * ("haiku") means nothing to MLX and an MLX repo id means nothing to a CLI.
+ */
+export function defaultModelFor(provider: string): string {
+  switch (provider) {
+    case "local-mlx":
+      return DEFAULT_LOCAL_MLX_MODEL;
+    case "claude-cli":
+      return "haiku";
+    case "openai-codex-cli":
+      return "gpt-5.6-luna";
+    default:
+      return "mock-model";
+  }
+}
+
+/** The effort to substitute when the user switches providers. */
+export function defaultEffortFor(provider: string): string {
+  return provider === "openai-codex-cli" ? "none" : "low";
 }
 
 export interface CommandPreviewInput {
@@ -53,6 +83,17 @@ const STDIN_NOTE =
  * `commandPreview`, that one is displayed instead of this reconstruction.
  */
 export function buildCommandPreview(input: CommandPreviewInput): CommandPreview {
+  if (input.provider === "local-mlx") {
+    return {
+      provider: input.provider,
+      label: "persistent on-device worker (mlx-lm); nothing leaves this Mac",
+      argv: ["<venv python>", "-m", "lvf_stt", "--role", "llm", "--model", input.model],
+      env: [{ name: "PYTHONPATH", value: "<worker dir>" }],
+      stdin:
+        "JSON Lines protocol: system prompt (KV-cached) + JSON payload (application context + glossary + dictated text). No network, no accounts, no quota.",
+    };
+  }
+
   if (input.provider === "openai-codex-cli") {
     return {
       provider: input.provider,

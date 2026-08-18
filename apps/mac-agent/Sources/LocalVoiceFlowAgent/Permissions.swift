@@ -135,9 +135,22 @@ public enum Permissions {
         case inputMonitoring = "Privacy_ListenEvent"
     }
 
+    /// Opens the exact privacy pane the user needs.
+    ///
+    /// System Settings replaced System Preferences in Ventura and renamed the target: the old
+    /// `com.apple.preference.security` identifier still opens *something* on current macOS, but
+    /// not reliably the requested section. The extension identifier is the one that lands on the
+    /// right list with the app's row visible, which is the whole point — a user who has to hunt
+    /// for the row is a user who ends up dragging the app in from Finder.
     public static func openSettings(_ pane: SettingsPane) {
-        let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?\(pane.rawValue)")
-        guard let url else { return }
-        NSWorkspace.shared.open(url)
+        let candidates = [
+            "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?\(pane.rawValue)",
+            "x-apple.systempreferences:com.apple.preference.security?\(pane.rawValue)",
+        ]
+        for candidate in candidates {
+            guard let url = URL(string: candidate) else { continue }
+            if NSWorkspace.shared.open(url) { return }
+        }
+        AgentLog.warn("could not open the \(pane.rawValue) settings pane")
     }
 }

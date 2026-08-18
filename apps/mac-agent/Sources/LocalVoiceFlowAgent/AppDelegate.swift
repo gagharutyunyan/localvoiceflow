@@ -89,18 +89,16 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, MenuBarDelegate
         }
 
         refreshPermissions()
-        Permissions.requestMicrophone { [weak self] state in
-            DispatchQueue.main.async {
-                MainActor.assumeIsolated {
-                    guard let self else { return }
-                    self.permissions.microphone = state
-                    self.refreshMenu()
-                    self.reportStatus()
-                }
-            }
-        }
-        requestMissingPermissions()
+        // Without this the app does not come back after a reboot: the LaunchAgent installed by
+        // scripts/install.sh runs core, not the menu bar.
+        LoginItem.registerIfFirstRun()
+        AgentLog.info("login item status: \(LoginItem.status)")
 
+        // No system prompt fires on its own here. Launching used to raise the Accessibility and
+        // Input Monitoring dialogs immediately, which meant a relaunch — after a rebuild, after a
+        // crash, after a login — threw a lock icon at the user with no context, and several
+        // relaunches stacked several dialogs. The onboarding window asks instead, and only when
+        // the user presses the button in it.
         startService()
         startPolling()
 
@@ -554,26 +552,6 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, MenuBarDelegate
         refreshMenu()
     }
 
-    /// Asks macOS for the permissions the app is still missing.
-    ///
-    /// This is not merely a prompt: `IOHIDRequestAccess` and `AXIsProcessTrustedWithOptions`
-    /// are what *register the app in the Input Monitoring and Accessibility lists*. Until one
-    /// of them runs, System Settings shows no LocalVoiceFlow row at all, so a user who opens
-    /// the pane has nothing to switch on and no way to tell why. Checking alone
-    /// (`IOHIDCheckAccess` / `AXIsProcessTrusted`) never creates the row.
-    ///
-    /// Only missing permissions are requested, so a fully set-up app never shows a prompt.
-    private func requestMissingPermissions() {
-        if permissions.accessibility != .granted {
-            Permissions.requestAccessibility(prompt: true)
-        }
-        if permissions.inputMonitoring != .granted {
-            Permissions.requestInputMonitoring()
-        }
-        refreshPermissions()
-        reportStatus(force: true)
-    }
-
     /// Explicit "Check permissions" click: this is the one place allowed to raise system prompts.
     public func menuBarDidRequestPermissionCheck() {
         let previous = permissions
@@ -590,6 +568,17 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, MenuBarDelegate
             hotkeys.startFnTap()
         }
         if previous != permissions { reportStatus() }
+        refreshMenu()
+    }
+
+    public func menuBarDidToggleLoginItem() {
+        let wasEnabled = LoginItem.isEnabled
+        LoginItem.setEnabled(!wasEnabled)
+        // macOS can park a freshly registered item in "requires approval" — then the switch the
+        // user needs is in System Settings, not here.
+        if !wasEnabled, LoginItem.status == .requiresApproval {
+            LoginItem.openSettings()
+        }
         refreshMenu()
     }
 

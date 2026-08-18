@@ -3,6 +3,7 @@ import { join } from "node:path";
 import {
   CORE_DEFAULT_HOST,
   CORE_DEFAULT_PORT,
+  DEFAULT_LOCAL_MLX_MODEL,
   type ProviderId,
   type Settings,
   type SttProvider,
@@ -17,6 +18,8 @@ import { buildServer } from "./server.js";
 import { ensureDirectories, findRepoRoot, resolvePaths } from "./paths.js";
 import { ClaudeCliProvider } from "./providers/claude.js";
 import { CodexCliProvider } from "./providers/codex.js";
+import { LocalMlxProvider, buildLocalSystemPrompt } from "./providers/local.js";
+import { LlmWorkerClient } from "./llm/worker-client.js";
 import { MockCorrectionProvider, MockSttProvider } from "./providers/mock.js";
 import {
   SttWorkerClient,
@@ -89,12 +92,62 @@ async function main(): Promise<void> {
   }
 
   // --- Text correction ------------------------------------------------------
+  const ctxHolder: { ctx?: ServerContext } = {};
+
+  // The local corrector shares the STT worker's venv (mlx-lm sits next to
+  // mlx-whisper) but runs as its own process, so a wedged generation never costs a
+  // Whisper reload and vice versa.
+  const localMlxWanted = (s: Settings): boolean =>
+    s.correction.provider === "local-mlx" ||
+    (s.correction.fallbackProviderEnabled && s.correction.fallbackProvider === "local-mlx");
+  const localMlxModel = (s: Settings): string =>
+    s.correction.provider === "local-mlx"
+      ? s.correction.model
+      : s.correction.fallbackProvider === "local-mlx"
+        ? s.correction.fallbackModel
+        : DEFAULT_LOCAL_MLX_MODEL;
+
+  const llmWorker = new LlmWorkerClient({
+    pythonPath: workerPython,
+    workerDir,
+    model: localMlxModel(settings),
+    logger: logger.child({ component: "llm" }),
+  });
+
+  // Fill the system-prompt KV cache the moment the model is up (and again after
+  // every worker restart): the first dictation then pays generation only, not a
+  // multi-second prompt prefill. Idempotent on the worker side.
+  llmWorker.on("health", (health: { ready: boolean }) => {
+    const ctx = ctxHolder.ctx;
+    if (health.ready && ctx) {
+      void llmWorker.warm(buildLocalSystemPrompt(ctx.loadSystemPrompt()));
+    }
+  });
+
+  const applyCorrectionSettings = (next: Settings): void => {
+    if (localMlxWanted(next)) {
+      const restarted = llmWorker.reconfigure({ model: localMlxModel(next) });
+      if (!llmWorker.isRunning && !restarted) {
+        void llmWorker.restart();
+      } else if (llmWorker.currentHealth.ready) {
+        // The custom system prompt may have changed; re-warm (no-op when unchanged).
+        const ctx = ctxHolder.ctx;
+        if (ctx) void llmWorker.warm(buildLocalSystemPrompt(ctx.loadSystemPrompt()));
+      }
+    } else if (llmWorker.isRunning) {
+      // 3.3 GB of weights have no business staying resident for a provider the user
+      // switched away from.
+      void llmWorker.stop();
+    }
+  };
+
   const providers = new Map<ProviderId, TextCorrectionProvider>();
   providers.set("claude-cli", new ClaudeCliProvider({ workDir: paths.cliWorkDir }));
   providers.set("openai-codex-cli", new CodexCliProvider({ workDir: paths.cliWorkDir }));
+  providers.set("local-mlx", new LocalMlxProvider({ worker: llmWorker }));
   providers.set("mock", new MockCorrectionProvider());
 
-  const ctxHolder: { ctx?: ServerContext } = {};
+  if (localMlxWanted(settings)) llmWorker.start();
 
   const pipeline = new Pipeline({
     db,
@@ -119,6 +172,7 @@ async function main(): Promise<void> {
     onSttSettingsChanged: (next: Settings) => {
       sttWorker?.reconfigure({ model: next.stt.model, warmUp: next.stt.warmUpOnStart });
     },
+    onCorrectionSettingsChanged: applyCorrectionSettings,
   });
   ctxHolder.ctx = ctx;
 
@@ -166,11 +220,13 @@ async function main(): Promise<void> {
       // Before `app.close()`: it waits for in-flight requests, and an SSE stream never
       // completes on its own.
       closeEventStreams();
-      // Start stopping the worker now rather than after the drain: the 1.6 GB Python
-      // child must already have its termination signals when the guard force-exits.
+      // Start stopping the workers now rather than after the drain: the multi-GB Python
+      // children must already have their termination signals when the guard force-exits.
       const workerStopped = sttWorker?.stop();
+      const llmStopped = llmWorker.stop();
       await app.close();
       await workerStopped;
+      await llmStopped;
       db.close();
       await logger.close();
     } finally {

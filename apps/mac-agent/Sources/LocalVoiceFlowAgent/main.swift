@@ -1,6 +1,14 @@
 import AppKit
 import Foundation
 
+// Uninstalling has to be able to undo the Login Items registration, and only the app itself can:
+// `SMAppService` has no command-line equivalent. Handled before anything else starts up, so the
+// process does its one job and exits without touching audio, hotkeys or core.
+if CommandLine.arguments.contains("--unregister-login-item") {
+    let removed = LoginItem.setEnabled(false)
+    exit(removed ? 0 : 1)
+}
+
 // LSUIElement in Resources/Info.plist keeps the bundled app out of the Dock; setting the policy
 // here as well makes `swift run` behave identically during development.
 let application = NSApplication.shared

@@ -59,6 +59,8 @@ public protocol MenuBarDelegate: AnyObject {
     func menuBarDidRequestPermissionCheck()
     /// Opens the window that walks through the three macOS grants.
     func menuBarDidRequestOnboarding()
+    /// Turns "start at login" on or off.
+    func menuBarDidToggleLoginItem()
     func menuBarDidRequestRestart()
     func menuBarDidRequestQuit()
     func menuBarDidRequestOpenSettingsPane(_ pane: Permissions.SettingsPane)
@@ -149,6 +151,19 @@ public final class MenuBarController: NSObject, NSMenuDelegate {
         menu.addItem(.separator())
         menu.addItem(permissionsSubmenuItem())
 
+        let login = NSMenuItem(
+            title: "Запускать при входе в систему",
+            action: #selector(toggleLoginItem),
+            keyEquivalent: ""
+        )
+        login.target = self
+        login.state = LoginItem.isEnabled ? .on : .off
+        if LoginItem.status == .requiresApproval {
+            login.title = "Запускать при входе — нужно подтвердить в настройках"
+        }
+        if LoginItem.status == .unavailable { login.isEnabled = false }
+        menu.addItem(login)
+
         let setup = NSMenuItem(title: "Настроить разрешения…", action: #selector(openOnboarding), keyEquivalent: "")
         setup.target = self
         menu.addItem(setup)
@@ -196,6 +211,10 @@ public final class MenuBarController: NSObject, NSMenuDelegate {
 
     @objc private func toggleService() { delegate?.menuBarDidToggleService() }
     @objc private func openDashboard() { delegate?.menuBarDidRequestDashboard() }
+    @objc private func toggleLoginItem() {
+        delegate?.menuBarDidToggleLoginItem()
+    }
+
     @objc private func openOnboarding() {
         delegate?.menuBarDidRequestOnboarding()
     }

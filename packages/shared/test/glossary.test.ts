@@ -292,10 +292,10 @@ describe("prompt serialization and injection defence", () => {
   });
 
   test("control characters are stripped but newlines and tabs survive", () => {
-    const input = "строка суправляющими\nсимволами\tи табом";
+    const input = "строка\u0000с\u0007управляющими\nсимволами\tи табом";
     const cleaned = stripControlCharacters(input);
-    assert.ok(!cleaned.includes(" "));
-    assert.ok(!cleaned.includes(""));
+    assert.ok(!cleaned.includes("\u0000"));
+    assert.ok(!cleaned.includes("\u0007"));
     assert.ok(cleaned.includes("\n"));
     assert.ok(cleaned.includes("\t"));
   });

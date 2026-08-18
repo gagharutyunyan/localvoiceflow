@@ -27,17 +27,26 @@ _LEVEL_MAP = {
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="lvf_stt",
-        description="LocalVoiceFlow MLX Whisper worker (JSON Lines over stdin/stdout).",
+        description="LocalVoiceFlow MLX worker (JSON Lines over stdin/stdout).",
+    )
+    parser.add_argument(
+        "--role",
+        default="stt",
+        choices=("stt", "llm"),
+        help="stt: the Whisper transcription worker (default); llm: the local "
+        "text-correction worker.",
     )
     parser.add_argument(
         "--model",
-        default=DEFAULT_MODEL,
-        help=f"Hugging Face repo id of the MLX Whisper model (default: {DEFAULT_MODEL})",
+        default=None,
+        help="Hugging Face repo id of the MLX model. Defaults to the role's standard "
+        f"model ({DEFAULT_MODEL} for stt).",
     )
     parser.add_argument(
         "--no-warmup",
         action="store_true",
-        help="Skip the warm-up decode; the first real phrase then pays MLX compilation.",
+        help="stt only: skip the warm-up decode; the first real phrase then pays MLX "
+        "compilation.",
     )
     parser.add_argument(
         "--log-level",
@@ -103,14 +112,21 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 
-    # Imported here so --help and --version never pay for numpy.
-    from .engine import WhisperEngine
-    from .worker import Worker
+    # Imported here so --help and --version never pay for numpy or MLX.
+    worker: object
+    if args.role == "llm":
+        from .llm_engine import DEFAULT_LLM_MODEL, LlmEngine
+        from .llm_worker import LlmWorker
 
-    engine = WhisperEngine(args.model, warmup=not args.no_warmup)
-    worker = Worker(engine, sys.stdin, protocol_out)
+        worker = LlmWorker(LlmEngine(args.model or DEFAULT_LLM_MODEL), sys.stdin, protocol_out)
+    else:
+        from .engine import WhisperEngine
+        from .worker import Worker
+
+        engine = WhisperEngine(args.model or DEFAULT_MODEL, warmup=not args.no_warmup)
+        worker = Worker(engine, sys.stdin, protocol_out)
     try:
-        return worker.run()
+        return worker.run()  # type: ignore[attr-defined]
     finally:
         try:
             protocol_out.flush()

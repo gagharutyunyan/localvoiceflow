@@ -11,7 +11,7 @@ LIB := $(REPO)/scripts/_lib.sh
 # Extra arguments for the wrapped script, e.g. `make benchmark ARGS="--runs=5"`.
 ARGS ?=
 
-.PHONY: help bootstrap dev build install start stop restart status permissions dashboard doctor test fixtures benchmark \
+.PHONY: help bootstrap dev build install start stop restart status permissions signing dashboard doctor test fixtures benchmark \
         uninstall uninstall-purge smoke-claude smoke-openai fmt clean
 
 help: ## Show this help
@@ -59,8 +59,11 @@ restart: ## Restart core and the menu-bar agent
 status: ## Показать, запущено ли всё и можно ли уже говорить
 	@"$(REPO)/scripts/status.sh" || true
 
-permissions: ## Пошагово выдать три разрешения macOS (микрофон, Fn, вставка)
+permissions: ## Открыть окно выдачи разрешений macOS (микрофон, Fn, вставка)
 	@"$(REPO)/scripts/permissions.sh"
+
+signing: ## Создать постоянный сертификат подписи, чтобы разрешения не слетали
+	@"$(REPO)/scripts/signing-identity.sh"
 
 dashboard: ## Открыть панель управления в браузере
 	@source "$(LIB)"; \

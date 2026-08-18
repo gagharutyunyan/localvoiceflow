@@ -43,6 +43,13 @@ export function registerSettingsRoutes(app: FastifyInstance, ctx: ServerContext)
       ctx.onSttSettingsChanged(after);
     }
 
+    // The local-LLM worker manager decides for itself whether anything must start,
+    // stop, reload or re-warm — its operations are idempotent, so any correction
+    // change may notify it.
+    if (JSON.stringify(before.correction) !== JSON.stringify(after.correction)) {
+      ctx.onCorrectionSettingsChanged(after);
+    }
+
     ctx.events.publish({ type: "settings-changed", at: new Date().toISOString() });
     return reply.send(after);
   });
@@ -57,7 +64,9 @@ export function registerSettingsRoutes(app: FastifyInstance, ctx: ServerContext)
   });
 
   app.post("/api/settings/reset-prompt", async (_request, reply) => {
-    ctx.db.patchSettings({ correction: { customSystemPrompt: "" } });
+    const after = ctx.db.patchSettings({ correction: { customSystemPrompt: "" } });
+    // The local worker caches the system prompt; give it a chance to re-warm.
+    ctx.onCorrectionSettingsChanged(after);
     ctx.events.publish({ type: "settings-changed", at: new Date().toISOString() });
     return reply.send({ systemPrompt: ctx.defaultSystemPrompt() });
   });
@@ -66,6 +75,7 @@ export function registerSettingsRoutes(app: FastifyInstance, ctx: ServerContext)
     return reply.send({
       "claude-cli": knownEffortsFor("claude-cli"),
       "openai-codex-cli": knownEffortsFor("openai-codex-cli"),
+      "local-mlx": knownEffortsFor("local-mlx"),
     });
   });
 
@@ -86,6 +96,17 @@ export function registerSettingsRoutes(app: FastifyInstance, ctx: ServerContext)
       "OPENAI_API_KEY",
       "CODEX_API_KEY",
     ];
+
+    if (provider === "local-mlx") {
+      return reply.send({
+        provider,
+        command: "<venv python>",
+        args: ["-m", "lvf_stt", "--role", "llm", "--model", model],
+        stdin: "<JSON Lines protocol: system prompt + JSON payload: app context, glossary, dictation>",
+        removedEnv: [],
+        note: "Runs entirely on this Mac inside a persistent worker process; the dictated text never leaves the machine.",
+      });
+    }
 
     if (provider === "openai-codex-cli") {
       return reply.send({

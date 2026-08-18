@@ -15,8 +15,22 @@ export const ModelIdSchema = z
     "model id may only contain letters, digits and . _ : @ / + -",
   );
 
-export const ProviderIdSchema = z.enum(["claude-cli", "openai-codex-cli", "mock"]);
+export const ProviderIdSchema = z.enum(["claude-cli", "openai-codex-cli", "local-mlx", "mock"]);
 export type ProviderId = z.infer<typeof ProviderIdSchema>;
+
+/**
+ * On-device correction models (MLX repo ids) offered as presets. Free-form ids are
+ * still accepted — any MLX chat model the machine can hold will work.
+ *
+ * Qwen3-4B is the default: measured on an M1 Pro it edits a short phrase in ~0.9 s
+ * and a paragraph in ~2.3 s with solid Russian quality, while the 1.7B tier loses
+ * content on long dictations and misses glossary substitutions.
+ */
+export const LOCAL_MLX_MODELS = [
+  "mlx-community/Qwen3-4B-Instruct-2507-4bit",
+  "mlx-community/Qwen3-8B-4bit",
+] as const;
+export const DEFAULT_LOCAL_MLX_MODEL = LOCAL_MLX_MODELS[0];
 
 /**
  * Effort values accepted by the installed CLIs.
@@ -194,6 +208,10 @@ export function knownEffortsFor(provider: ProviderId): readonly string[] {
       return CLAUDE_EFFORTS;
     case "openai-codex-cli":
       return CODEX_EFFORTS;
+    case "local-mlx":
+      // No reasoning-effort knob on a plain instruct model; a single value keeps the
+      // effort validation and the UI honest.
+      return ["low"];
     default:
       return ["low"];
   }

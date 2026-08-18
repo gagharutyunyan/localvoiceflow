@@ -17,7 +17,14 @@ import { StatusPill } from "../components/StatusPill";
 import { Labeled, Toolbar } from "../components/Toolbar";
 import { useToast } from "../components/Toast";
 import { EM_DASH, downloadText, formatDateTime, formatMs, stamp } from "../lib/format";
-import { PROVIDER_LABELS, buildCommandPreview, effortsFor, providerLabel } from "../lib/providers";
+import {
+  PROVIDER_LABELS,
+  buildCommandPreview,
+  defaultEffortFor,
+  defaultModelFor,
+  effortsFor,
+  providerLabel,
+} from "../lib/providers";
 
 const PRIVACY_LOCAL_AUDIO = "Audio is processed locally.";
 const PRIVACY_LLM_SCOPE =
@@ -316,7 +323,7 @@ export function Settings() {
   // Kept current on every render so an in-flight test can tell whether the combination
   // it started for is still the one on screen.
   const comboRef = useRef("");
-  comboRef.current = `${provider} ${model} ${effort}`;
+  comboRef.current = `${provider}\u0000${model}\u0000${effort}`;
 
   const efforts = useMemo(() => effortsFor(provider, capabilities.data), [provider, capabilities.data]);
   const fallbackEfforts = useMemo(
@@ -742,7 +749,15 @@ export function Settings() {
                   type="radio"
                   name="provider"
                   checked={provider === id}
-                  onChange={() => patchCorrection({ provider: id as SettingsData["correction"]["provider"] })}
+                  onChange={() =>
+                    // A model id is provider-specific ("haiku" vs an MLX repo id), so
+                    // switching providers swaps in that provider's defaults too.
+                    patchCorrection({
+                      provider: id as SettingsData["correction"]["provider"],
+                      model: defaultModelFor(id),
+                      effort: defaultEffortFor(id),
+                    })
+                  }
                 />
                 {providerLabel(id)}
               </label>
@@ -921,6 +936,8 @@ export function Settings() {
                   onChange={(event) =>
                     patchCorrection({
                       fallbackProvider: event.target.value as SettingsData["correction"]["fallbackProvider"],
+                      fallbackModel: defaultModelFor(event.target.value),
+                      fallbackEffort: defaultEffortFor(event.target.value),
                     })
                   }
                 >
