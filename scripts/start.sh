@@ -47,6 +47,65 @@ done
 lvf_require_macos_arm64
 lvf_ensure_dirs
 
+# Two parallel starts (make start, start-core.sh, the app bundle) can each pass
+# the health check below before either has bound the port. Only the holder of
+# this mkdir lock may fork node; everyone else waits and re-checks. Shared with
+# start-core.sh — same directory, same protocol. Keyed by port: starts for
+# different LVF_PORT values do not compete for anything.
+START_LOCK_DIR="$LVF_DATA_DIR/core.start.$LVF_PORT.lock"
+
+start_lock_owner() {
+  # stderr silenced before the input redirect: with `<file 2>...` the shell
+  # reports a missing file before the redirect takes effect.
+  tr -cd '0-9' 2>/dev/null <"$START_LOCK_DIR/pid" || true
+}
+
+start_lock_stale() {
+  # Stale: older than any legitimate startup (a holder waits at most ~30s for
+  # health), or the recorded owner is gone and the lock is old enough that the
+  # owner cannot still be between mkdir and writing its pid.
+  local owner now mtime age
+  now="$(date +%s)"
+  mtime="$(stat -f %m "$START_LOCK_DIR" 2>/dev/null || printf '%s' "$now")"
+  age=$((now - mtime))
+  ((age > 120)) && return 0
+  owner="$(start_lock_owner)"
+  if [[ -n "$owner" ]] && kill -0 "$owner" 2>/dev/null; then
+    return 1
+  fi
+  ((age > 30))
+}
+
+release_start_lock() {
+  # Only the recorded owner may remove the lock: after a steal the directory
+  # belongs to the stealer, and a path-based rm would destroy their fresh lock.
+  if [[ "$(start_lock_owner)" == "$$" ]]; then
+    rm -rf "$START_LOCK_DIR"
+  fi
+  return 0
+}
+
+acquire_start_lock() {
+  local deadline=$((SECONDS + 40))
+  while ((SECONDS < deadline)); do
+    if mkdir "$START_LOCK_DIR" 2>/dev/null; then
+      printf '%s\n' "$$" >"$START_LOCK_DIR/pid"
+      trap 'release_start_lock' EXIT
+      return 0
+    fi
+    if start_lock_stale; then
+      # Steal via atomic rename: a second stealer must never be able to delete
+      # the fresh lock the first stealer has just re-created.
+      if mv "$START_LOCK_DIR" "$START_LOCK_DIR.stale.$$" 2>/dev/null; then
+        rm -rf "$START_LOCK_DIR.stale.$$"
+      fi
+      continue
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+
 step "Core"
 
 if lvf_core_reachable 2; then
@@ -66,27 +125,42 @@ else
   NODE_BIN="$(lvf_node)" || die "node not found. Run scripts/bootstrap.sh."
   [[ -f "$LVF_CORE_ENTRY" ]] || die "core is not built: $LVF_CORE_ENTRY — run 'make build'"
 
-  if PORT_PID="$(lvf_port_pid "$LVF_PORT")" && [[ -n "$PORT_PID" ]]; then
-    fail "port $LVF_PORT is already taken by pid $PORT_PID, but it does not answer /api/health"
-    note "$(lvf_process_command "$PORT_PID")"
-    hint "Free it with: scripts/stop.sh   (or set LVF_PORT to another port)"
-    exit 1
-  fi
-
-  (
-    cd "$LVF_REPO_ROOT"
-    LVF_PORT="$LVF_PORT" nohup "$NODE_BIN" "$LVF_CORE_ENTRY" >>"$LVF_CORE_LOG" 2>&1 &
-    printf '%s\n' "$!" >"$LVF_PID_FILE"
-  )
-  CORE_PID="$(tr -cd '0-9' <"$LVF_PID_FILE")"
-  ok "core started (pid $CORE_PID), log: $LVF_CORE_LOG"
-
-  if lvf_wait_for_core "$WAIT_SECONDS"; then
-    ok "healthy on $LVF_BASE_URL"
+  if ! acquire_start_lock; then
+    # Could not get the lock: a parallel start is still working, or a stuck
+    # lock survived even the staleness rules. Health decides which it was.
+    if lvf_core_reachable 2; then
+      ok "already listening on $LVF_BASE_URL (a parallel start won the race)"
+    else
+      fail "another start holds $START_LOCK_DIR and did not finish"
+      hint "Retry in a few seconds; if it persists, remove that directory."
+      exit 1
+    fi
+  elif lvf_core_reachable 2; then
+    # The lock was busy while we waited: whoever held it started core already.
+    ok "already listening on $LVF_BASE_URL"
   else
-    fail "core did not become healthy within ${WAIT_SECONDS}s"
-    hint "Read the log: tail -n 50 \"$LVF_CORE_LOG\""
-    exit 1
+    if PORT_PID="$(lvf_port_pid "$LVF_PORT")" && [[ -n "$PORT_PID" ]]; then
+      fail "port $LVF_PORT is already taken by pid $PORT_PID, but it does not answer /api/health"
+      note "$(lvf_process_command "$PORT_PID")"
+      hint "Free it with: scripts/stop.sh   (or set LVF_PORT to another port)"
+      exit 1
+    fi
+
+    (
+      cd "$LVF_REPO_ROOT"
+      LVF_PORT="$LVF_PORT" nohup "$NODE_BIN" "$LVF_CORE_ENTRY" >>"$LVF_CORE_LOG" 2>&1 &
+      printf '%s\n' "$!" >"$LVF_PID_FILE"
+    )
+    CORE_PID="$(tr -cd '0-9' <"$LVF_PID_FILE")"
+    ok "core started (pid $CORE_PID), log: $LVF_CORE_LOG"
+
+    if lvf_wait_for_core "$WAIT_SECONDS"; then
+      ok "healthy on $LVF_BASE_URL"
+    else
+      fail "core did not become healthy within ${WAIT_SECONDS}s"
+      hint "Read the log: tail -n 50 \"$LVF_CORE_LOG\""
+      exit 1
+    fi
   fi
 fi
 

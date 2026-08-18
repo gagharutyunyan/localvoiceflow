@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import queue
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import wave
 from unittest import mock
@@ -24,7 +26,7 @@ from lvf_stt.engine import (  # noqa: E402
     is_filler_hallucination,
     normalize_transcript,
 )
-from lvf_stt.worker import Worker  # noqa: E402
+from lvf_stt.worker import Watchdog, Worker  # noqa: E402
 
 RECV_TIMEOUT = 10.0
 
@@ -119,7 +121,14 @@ class FakeEngine:
 
 
 class Harness:
-    def __init__(self, engine: FakeEngine, *, load_timeout_s: float = 5.0) -> None:
+    def __init__(
+        self,
+        engine: FakeEngine,
+        *,
+        load_timeout_s: float = 5.0,
+        watchdog: Watchdog | None = None,
+        **worker_kwargs,
+    ) -> None:
         in_r, in_w = os.pipe()
         out_r, out_w = os.pipe()
         self._stdin_read = os.fdopen(in_r, "r", encoding="utf-8", newline="\n")
@@ -127,8 +136,18 @@ class Harness:
         self._stdout_read = os.fdopen(out_r, "r", encoding="utf-8", newline="\n")
         self._stdout_write = os.fdopen(out_w, "w", encoding="utf-8", newline="\n")
 
+        # A recording watchdog by default: a stray firing must not os._exit the
+        # test process, and tests can assert nothing fired.
+        self.watchdog_fires: list[str] = []
+        if watchdog is None:
+            watchdog = Watchdog(on_timeout=self.watchdog_fires.append)
         self.worker = Worker(
-            engine, self._stdin_read, self._stdout_write, load_timeout_s=load_timeout_s
+            engine,
+            self._stdin_read,
+            self._stdout_write,
+            load_timeout_s=load_timeout_s,
+            watchdog=watchdog,
+            **worker_kwargs,
         )
         self.exit_code: int | None = None
         self.messages: queue.Queue = queue.Queue()
@@ -362,6 +381,48 @@ class TestTranscribeDispatch(WorkerTestCase):
         self.assertFalse(reply["no_speech"])
         self.assertEqual(reply["raw_transcript"], "Продолжение следует...")
 
+    def test_a_loud_short_bye_is_kept(self) -> None:
+        # "Bye" is on the denylist, but a capture at normal speaking level is real
+        # speech no matter how short — it must never be swallowed as no_speech.
+        engine = FakeEngine(text="Bye.")
+        harness = self.start(engine)
+        harness.await_ready()
+        wav = self.path("bye.wav")
+        write_wav(wav, tone(0.6, amplitude=0.35))
+        harness.send({"id": "t1", "op": "transcribe", "audio_path": wav})
+        reply = harness.recv_matching(lambda m: m.get("id") == "t1")
+        self.assertFalse(reply["no_speech"])
+        self.assertEqual(reply["raw_transcript"], "Bye.")
+        self.assertNotIn("hallucination_filtered", reply["warnings"])
+
+    def test_duplicate_transcribe_id_is_dropped_while_in_flight(self) -> None:
+        gate = threading.Event()
+        engine = FakeEngine(decode_gate=gate)
+        harness = self.start(engine)
+        harness.await_ready()
+
+        wav = self.path("speech.wav")
+        write_wav(wav, tone(1.0))
+        harness.send({"id": "t1", "op": "transcribe", "audio_path": wav})
+        self.assertTrue(engine.decode_started.wait(RECV_TIMEOUT))
+
+        with self.assertLogs("lvf_stt.worker", level="WARNING") as captured:
+            harness.send({"id": "t1", "op": "transcribe", "audio_path": wav})
+            # The health round-trip proves the duplicate line has been dispatched.
+            harness.send({"id": "h1", "op": "health"})
+            harness.recv_matching(lambda m: m.get("id") == "h1")
+        self.assertTrue(any("duplicate" in line for line in captured.output))
+
+        gate.set()
+        reply = harness.recv_matching(lambda m: m.get("id") == "t1")
+        self.assertTrue(reply["ok"])
+
+        # Exactly one decode ran, and no second t1 line follows.
+        harness.send({"id": "h2", "op": "health"})
+        follow_up = harness.recv_matching(lambda m: m.get("id") in ("h2", "t1"))
+        self.assertEqual(follow_up["id"], "h2")
+        self.assertEqual(len(engine.calls), 1)
+
     def test_empty_engine_output_is_no_speech(self) -> None:
         engine = FakeEngine(text="   ")
         harness = self.start(engine)
@@ -541,6 +602,169 @@ class TestShutdown(WorkerTestCase):
         self.assertEqual(remaining, [])
 
 
+class TestWatchdogUnit(unittest.TestCase):
+    def _watchdog(self) -> tuple[Watchdog, threading.Event, list[str]]:
+        fired = threading.Event()
+        reasons: list[str] = []
+
+        def on_timeout(reason: str) -> None:
+            reasons.append(reason)
+            fired.set()
+
+        return Watchdog(on_timeout=on_timeout), fired, reasons
+
+    def test_fires_with_the_armed_reason(self) -> None:
+        watchdog, fired, reasons = self._watchdog()
+        watchdog.arm(0.05, "stuck decode")
+        self.assertTrue(fired.wait(RECV_TIMEOUT))
+        self.assertEqual(reasons, ["stuck decode"])
+
+    def test_disarm_cancels_the_deadline(self) -> None:
+        watchdog, fired, _ = self._watchdog()
+        watchdog.arm(0.1, "never happens")
+        watchdog.disarm()
+        self.assertFalse(fired.wait(0.4))
+
+    def test_rearming_replaces_the_deadline(self) -> None:
+        watchdog, fired, reasons = self._watchdog()
+        watchdog.arm(30.0, "first")
+        watchdog.arm(0.05, "second")
+        self.assertTrue(fired.wait(RECV_TIMEOUT))
+        self.assertEqual(reasons, ["second"])
+
+
+class TestWatchdogIntegration(WorkerTestCase):
+    """A hung MLX call must end the process; a healthy worker must never trip it."""
+
+    def _recording_watchdog(self) -> tuple[Watchdog, threading.Event, list[str]]:
+        fired = threading.Event()
+        reasons: list[str] = []
+
+        def on_timeout(reason: str) -> None:
+            reasons.append(reason)
+            fired.set()
+
+        return Watchdog(on_timeout=on_timeout), fired, reasons
+
+    def test_hung_load_trips_the_watchdog(self) -> None:
+        watchdog, fired, reasons = self._recording_watchdog()
+        gate = threading.Event()
+        self.start(FakeEngine(load_gate=gate), load_timeout_s=0.3, watchdog=watchdog)
+        self.assertTrue(fired.wait(RECV_TIMEOUT))
+        self.assertIn("load", reasons[0])
+        gate.set()
+
+    def test_hung_decode_trips_the_watchdog(self) -> None:
+        watchdog, fired, reasons = self._recording_watchdog()
+        gate = threading.Event()
+        engine = FakeEngine(decode_gate=gate)
+        harness = self.start(
+            engine,
+            watchdog=watchdog,
+            decode_timeout_base_s=0.3,
+            decode_timeout_per_audio_s=0.0,
+        )
+        harness.await_ready()
+
+        wav = self.path("speech.wav")
+        write_wav(wav, tone(1.0))
+        harness.send({"id": "t1", "op": "transcribe", "audio_path": wav})
+        self.assertTrue(engine.decode_started.wait(RECV_TIMEOUT))
+        self.assertTrue(fired.wait(RECV_TIMEOUT))
+        self.assertIn("t1", reasons[0])
+        gate.set()
+
+    def test_watchdog_stays_quiet_across_a_healthy_lifecycle(self) -> None:
+        # Budgets shorter than the idle wait below: a leaked arm would fire.
+        engine = FakeEngine()
+        harness = self.start(
+            engine,
+            load_timeout_s=1.0,
+            decode_timeout_base_s=1.0,
+            decode_timeout_per_audio_s=0.0,
+        )
+        harness.await_ready()
+        wav = self.path("speech.wav")
+        write_wav(wav, tone(1.0))
+        harness.send({"id": "t1", "op": "transcribe", "audio_path": wav})
+        self.assertTrue(harness.recv_matching(lambda m: m.get("id") == "t1")["ok"])
+
+        time.sleep(1.5)
+        self.assertEqual(harness.watchdog_fires, [])
+        harness.send({"id": "h1", "op": "health"})
+        self.assertTrue(harness.recv_matching(lambda m: m.get("id") == "h1")["ok"])
+
+
+class TestStdinRobustness(unittest.TestCase):
+    def test_oserror_on_stdin_ends_the_loop_instead_of_crashing(self) -> None:
+        class BrokenStdin:
+            def readline(self) -> str:
+                raise OSError(5, "input/output error")
+
+        worker = Worker(
+            FakeEngine(),
+            BrokenStdin(),
+            io.StringIO(),
+            load_timeout_s=5.0,
+            watchdog=Watchdog(on_timeout=lambda reason: None),
+        )
+        self.assertEqual(worker.run(), 0)
+
+
+class TestClaimStdout(unittest.TestCase):
+    def test_failure_to_claim_stdout_is_logged_and_falls_back(self) -> None:
+        import lvf_stt.__main__ as main_mod
+
+        with mock.patch.object(main_mod.os, "dup", side_effect=OSError(24, "too many open files")):
+            with self.assertLogs("lvf_stt.__main__", level="WARNING") as captured:
+                stream = main_mod._claim_stdout()
+        self.assertIs(stream, sys.stdout)
+        self.assertTrue(any("stdout" in line for line in captured.output))
+
+
+class TestDependencyPins(unittest.TestCase):
+    """scripts/bootstrap.sh installs requirements.txt, not pyproject.toml.
+
+    A version cap present in only one of the two lists is a dead letter for the
+    other install path, so they must exist and stay identical.
+    """
+
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def _requirement_lines(self) -> list[str]:
+        path = os.path.join(self.ROOT, "requirements.txt")
+        self.assertTrue(
+            os.path.exists(path),
+            "requirements.txt is missing — scripts/bootstrap.sh would fall back "
+            "to its own uncapped package list",
+        )
+        with open(path, encoding="utf-8") as handle:
+            return [
+                line.strip()
+                for line in handle
+                if line.strip() and not line.strip().startswith("#")
+            ]
+
+    def test_requirements_txt_matches_pyproject_dependencies(self) -> None:
+        import tomllib
+
+        with open(os.path.join(self.ROOT, "pyproject.toml"), "rb") as handle:
+            pyproject = tomllib.load(handle)
+        self.assertEqual(
+            sorted(self._requirement_lines()),
+            sorted(pyproject["project"]["dependencies"]),
+        )
+
+    def test_mlx_whisper_is_capped_below_0_5(self) -> None:
+        # engine.py keeps protocol stdout pure JSON via verbose=None semantics
+        # verified against 0.4.x only; a fresh bootstrap must never pick up 0.5.
+        mlx_lines = [
+            line for line in self._requirement_lines() if line.startswith("mlx-whisper")
+        ]
+        self.assertEqual(len(mlx_lines), 1)
+        self.assertIn("<0.5", mlx_lines[0].replace(" ", ""))
+
+
 class TestEnginePureFunctions(unittest.TestCase):
     """These live in engine.py but import no MLX, so they run everywhere."""
 
@@ -589,7 +813,7 @@ class TestEnginePureFunctions(unittest.TestCase):
     def test_build_kwargs_fp32(self) -> None:
         self.assertFalse(build_transcribe_kwargs("m", "ru", "", fp16=False)["fp16"])
 
-    def test_filler_guard_fires_only_on_short_or_quiet_audio(self) -> None:
+    def test_filler_guard_fires_only_on_short_and_quiet_audio(self) -> None:
         phrases = ("Продолжение следует...", "Thank you.", "you", "Субтитры сделал DimaTorzok")
         for phrase in phrases:
             with self.subTest(phrase=phrase):
@@ -598,6 +822,14 @@ class TestEnginePureFunctions(unittest.TestCase):
                 )
                 self.assertFalse(
                     is_filler_hallucination(phrase, duration_ms=5000, peak=0.4)
+                )
+                # Loud proves real speech, however short the phrase is.
+                self.assertFalse(
+                    is_filler_hallucination(phrase, duration_ms=500, peak=0.3)
+                )
+                # So does a long voiced span, however quiet the speaker is.
+                self.assertFalse(
+                    is_filler_hallucination(phrase, duration_ms=5000, peak=0.02)
                 )
 
     def test_filler_guard_never_touches_real_sentences(self) -> None:

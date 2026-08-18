@@ -13,6 +13,7 @@ import { Labeled, Toolbar } from "../components/Toolbar";
 import { useToast } from "../components/Toast";
 import { EM_DASH, formatDateTimeShort, formatMs, fromDateTimeLocal } from "../lib/format";
 import { PROVIDER_LABELS, effortsFor } from "../lib/providers";
+import { withIdsSelected } from "../lib/selection";
 
 const PAGE_SIZE = 50;
 
@@ -272,6 +273,14 @@ export function History() {
   const items = list.data?.items ?? [];
   const total = list.data?.total ?? 0;
 
+  // Deletions can leave the page offset past the end of the shrunken list; snap back to
+  // the last page that still has rows instead of showing an empty table.
+  useEffect(() => {
+    if (list.data && offset > 0 && offset >= total) {
+      setOffset(total === 0 ? 0 : Math.floor((total - 1) / PAGE_SIZE) * PAGE_SIZE);
+    }
+  }, [list.data, offset, total]);
+
   const suggestions = useMemo(() => {
     const bundles = new Set<string>();
     const providers = new Set<string>();
@@ -304,6 +313,9 @@ export function History() {
     );
   };
 
+  // The optimistic local removal keeps the table responsive, but only the reload in
+  // deleteOne/deleteSelected brings offset and total back in sync with the server —
+  // without it "Older →" would skip the records that shifted into this page.
   const removeRecords = (ids: readonly string[]) => {
     const gone = new Set(ids);
     list.setData((current) =>
@@ -314,17 +326,14 @@ export function History() {
           }
         : current,
     );
-    setSelected((current) => {
-      const next = new Set(current);
-      for (const id of gone) next.delete(id);
-      return next;
-    });
+    setSelected((current) => withIdsSelected(current, ids, false));
   };
 
   const deleteOne = async (id: string) => {
     try {
       await api.deleteDictation(id);
       removeRecords([id]);
+      list.reload();
       toast.success("Record deleted");
     } catch (error) {
       toast.error(errorMessage(error));
@@ -336,6 +345,7 @@ export function History() {
     try {
       await api.deleteDictations(ids);
       removeRecords(ids);
+      list.reload();
       toast.success(`${ids.length} records deleted`);
     } catch (error) {
       toast.error(errorMessage(error));
@@ -488,7 +498,9 @@ export function History() {
                     aria-label="Select all on this page"
                     checked={allOnPageSelected}
                     onChange={(event) =>
-                      setSelected(event.target.checked ? new Set(items.map((item) => item.id)) : new Set())
+                      setSelected((current) =>
+                        withIdsSelected(current, items.map((item) => item.id), event.target.checked),
+                      )
                     }
                   />
                 </th>

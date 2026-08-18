@@ -140,8 +140,3 @@ export class Logger {
     await this.#sink.close();
   }
 }
-
-/** Safe description of a piece of user text for logs: length only, never content. */
-export function textLength(text: string | undefined | null): number | undefined {
-  return text === undefined || text === null ? undefined : text.length;
-}

@@ -74,6 +74,15 @@ export function runCli(command: string, options: RunOptions): Promise<RunResult>
   const maxOutput = options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT;
 
   return new Promise<RunResult>((resolve, reject) => {
+    // An "abort" listener added to an already-fired signal never runs, so a signal
+    // aborted before this call (Esc or shutdown during the awaits leading up to the
+    // spawn) would leave the child running unsupervised — burning quota and outliving
+    // the process. Refuse to spawn at all instead.
+    if (options.signal?.aborted) {
+      reject(new PipelineError("cancelled", `${command} not started: already cancelled`));
+      return;
+    }
+
     const startedAt = process.hrtime.bigint();
 
     let child: ChildProcessWithoutNullStreams;
@@ -111,17 +120,38 @@ export function runCli(command: string, options: RunOptions): Promise<RunResult>
       }
     };
 
+    // `close` waits for the stdio pipes, and a grandchild that escaped the process group
+    // (setsid) can inherit them and never let go — SIGKILL on the group cannot reach it.
+    // Once the kill escalation has run its course, settle the promise anyway: detach the
+    // pipes and report a timeout, so the pipeline is never held open forever.
+    const armFinalDeadline = (afterMs: number) => {
+      setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        options.signal?.removeEventListener("abort", onAbort);
+        child.stdout.destroy();
+        child.stderr.destroy();
+        child.stdin.destroy();
+        reject(
+          new PipelineError("llm_timeout", `${command} did not release its pipes after SIGKILL`),
+        );
+      }, afterMs).unref();
+    };
+
     const timer = setTimeout(() => {
       timedOut = true;
       killTree("SIGTERM");
       // A CLI that ignores SIGTERM must not hold the pipeline open forever.
       setTimeout(() => killTree("SIGKILL"), 2000).unref();
+      armFinalDeadline(4000);
     }, options.timeoutMs);
     timer.unref();
 
     const onAbort = () => {
       killTree("SIGTERM");
       setTimeout(() => killTree("SIGKILL"), 1000).unref();
+      armFinalDeadline(3000);
     };
     options.signal?.addEventListener("abort", onAbort, { once: true });
 

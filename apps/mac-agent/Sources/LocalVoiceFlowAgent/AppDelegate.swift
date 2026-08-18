@@ -37,8 +37,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, MenuBarDelegate
     private var bootstrapTask: Task<Void, Never>?
 
     private var captureTarget: TargetAppSnapshot?
+    /// Cleared on delivery, failure *and* Escape-cancel: a late SSE event for a dictation that is
+    /// no longer in flight must not resurrect the HUD.
     private var inFlightDictationId: String?
-    private var pendingDictationId: String?
+    /// Raw transcript of the dictation in flight, from the `transcribed` SSE event; shown in the
+    /// HUD while the LLM works so the user sees their words before anything is inserted.
+    private var inFlightTranscript: String?
     /// Send the user to System Settings once, not on every attempted dictation.
     private var didOfferMicrophoneSettings = false
     private var lastReportedStatus: AgentStatusPayload?
@@ -85,6 +89,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, MenuBarDelegate
                 }
             }
         }
+        requestMissingPermissions()
 
         startService()
         startPolling()
@@ -204,13 +209,15 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, MenuBarDelegate
             if let error { lastError = error }
         case .settingsChanged:
             Task { [weak self] in await self?.reloadConfig() }
-        case .pipeline(let dictationId, let stage):
-            guard dictationId == inFlightDictationId || dictationId == pendingDictationId else { return }
+        case .pipeline(let dictationId, let stage, let text):
+            guard dictationId == inFlightDictationId else { return }
             switch stage {
             case .received, .transcribing:
                 hud.show(.transcribing)
             case .transcribed, .correcting:
-                hud.show(.improving)
+                // `transcribed` carries the text; the `correcting` events after it do not.
+                if let text, !text.isEmpty { inFlightTranscript = text }
+                hud.show(.improving(transcript: inFlightTranscript))
             case .completed, .failed, .cancelled:
                 break
             }
@@ -328,6 +335,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, MenuBarDelegate
         // Escape while core is still working on a submitted dictation is a cancel, not a no-op.
         if case .escapePressed = event, !machine.isCapturing, let id = inFlightDictationId {
             inFlightDictationId = nil
+            inFlightTranscript = nil
             processingTask?.cancel()
             hud.hide()
             Task { [core] in await core.cancelDictation(id: id) }
@@ -426,8 +434,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, MenuBarDelegate
         }
 
         let dictationId = "dct_agent_\(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(20))"
-        pendingDictationId = dictationId
         inFlightDictationId = dictationId
+        inFlightTranscript = nil
         hud.show(.transcribing)
 
         processingTask?.cancel()
@@ -455,7 +463,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, MenuBarDelegate
 
     private func deliver(_ outcome: DictationOutcome, target: TargetAppSnapshot?) {
         inFlightDictationId = nil
-        pendingDictationId = nil
+        inFlightTranscript = nil
 
         switch outcome.status {
         case "cancelled":
@@ -487,9 +495,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, MenuBarDelegate
 
         switch result.method {
         case .accessibility, .paste:
-            hud.show(.inserted)
+            hud.show(.inserted(text: text))
         case .clipboardOnly:
-            hud.show(.copiedToClipboard(reason: result.message))
+            hud.show(.copiedToClipboard(reason: result.message, text: text))
         }
 
         if outcome.isRawFallback == true {
@@ -503,7 +511,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, MenuBarDelegate
 
     private func failDictation(_ error: Error) {
         inFlightDictationId = nil
-        pendingDictationId = nil
+        inFlightTranscript = nil
         let message: String
         if let clientError = error as? CoreClientError {
             message = clientError.description
@@ -533,6 +541,26 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, MenuBarDelegate
         refreshPermissions()
         if previous != permissions { reportStatus() }
         refreshMenu()
+    }
+
+    /// Asks macOS for the permissions the app is still missing.
+    ///
+    /// This is not merely a prompt: `IOHIDRequestAccess` and `AXIsProcessTrustedWithOptions`
+    /// are what *register the app in the Input Monitoring and Accessibility lists*. Until one
+    /// of them runs, System Settings shows no LocalVoiceFlow row at all, so a user who opens
+    /// the pane has nothing to switch on and no way to tell why. Checking alone
+    /// (`IOHIDCheckAccess` / `AXIsProcessTrusted`) never creates the row.
+    ///
+    /// Only missing permissions are requested, so a fully set-up app never shows a prompt.
+    private func requestMissingPermissions() {
+        if permissions.accessibility != .granted {
+            Permissions.requestAccessibility(prompt: true)
+        }
+        if permissions.inputMonitoring != .granted {
+            Permissions.requestInputMonitoring()
+        }
+        refreshPermissions()
+        reportStatus(force: true)
     }
 
     /// Explicit "Check permissions" click: this is the one place allowed to raise system prompts.

@@ -18,6 +18,13 @@ import numpy as np
 
 TARGET_SAMPLE_RATE = 16_000
 
+#: Hard ceiling on input duration, checked against the header before a single frame
+#: is read. The product's settings cap ``maxRecordingSeconds`` at 1800
+#: (packages/shared/src/settings.ts); one extra minute absorbs stop latency.
+#: Anything longer is a stuck capture, and decoding it would cost hundreds of MB on
+#: top of the resident model.
+MAX_WAV_SECONDS = 1860
+
 #: Peak below which a sample counts as silence. Deliberately low — quiet Russian
 #: speech at arm's length from a MacBook mic peaks around 0.02-0.05, so anything
 #: above ~0.01 starts clipping real words.
@@ -100,16 +107,27 @@ def read_wav(path: str) -> AudioClip:
             comp_type = handle.getcomptype()
             if comp_type != "NONE":
                 raise AudioError(f"wav is compressed ({comp_type}), expected PCM")
+            if sample_rate <= 0:
+                raise AudioError(f"wav declares sample rate {sample_rate}")
+            duration_s = frame_count / sample_rate
+            if duration_s > MAX_WAV_SECONDS:
+                raise AudioError(
+                    f"wav is {duration_s:.0f} s long, over the {MAX_WAV_SECONDS} s limit"
+                )
             raw = handle.readframes(frame_count)
     except AudioError:
         raise
     except (wave.Error, OSError, EOFError) as exc:
         raise AudioError(f"cannot read wav {path!r}: {exc}") from exc
 
-    if sample_rate <= 0:
-        raise AudioError(f"wav declares sample rate {sample_rate}")
-
-    frames = _decode_frames(raw, sample_width, channels)
+    try:
+        frames = _decode_frames(raw, sample_width, channels)
+    except AudioError:
+        raise
+    except ValueError as exc:
+        # A truncated data chunk leaves a byte count that is not a whole number of
+        # samples; np.frombuffer reports that as a bare ValueError.
+        raise AudioError(f"cannot decode wav {path!r}: {exc}") from exc
     if sample_width != 2:
         warnings.append(f"sample_width_{sample_width * 8}bit")
 

@@ -14,6 +14,7 @@ import { Labeled, Toolbar } from "../components/Toolbar";
 import { useToast } from "../components/Toast";
 import { csvToTerms, jsonToTerms, parseCsv } from "../lib/csv";
 import { EM_DASH } from "../lib/format";
+import { withIdsSelected } from "../lib/selection";
 
 const LANGUAGES: TermLanguage[] = ["ru", "en", "mixed"];
 
@@ -370,6 +371,9 @@ export function Dictionary() {
       list.setData((current) =>
         current ? { items: current.items.filter((item) => item.id !== term.id) } : current,
       );
+      // A deleted term must not linger in the selection: it is invisible to the header
+      // checkbox, so nothing else would ever clear it.
+      setSelected((current) => withIdsSelected(current, [term.id], false));
       toast.success("Term deleted");
     } catch (error) {
       toast.error(errorMessage(error));
@@ -422,6 +426,8 @@ export function Dictionary() {
       toast.success(
         `Imported: ${result.created} created, ${result.updated} updated, ${result.skipped} skipped`,
       );
+      // Replace mode recreates every term with fresh ids, so the old selection is all phantoms.
+      if (importState.mode === "replace") setSelected(new Set());
       setImportState(null);
       list.reload();
     } catch (error) {
@@ -522,7 +528,9 @@ export function Dictionary() {
                     aria-label="Select all listed terms"
                     checked={visible.length > 0 && visible.every((term) => selected.has(term.id))}
                     onChange={(event) =>
-                      setSelected(event.target.checked ? new Set(visible.map((term) => term.id)) : new Set())
+                      setSelected((current) =>
+                        withIdsSelected(current, visible.map((term) => term.id), event.target.checked),
+                      )
                     }
                   />
                 </th>

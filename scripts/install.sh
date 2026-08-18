@@ -209,13 +209,39 @@ step "Loading the LaunchAgent"
 
 UID_NUM="$(id -u)"
 launchctl bootout "gui/$UID_NUM/$LVF_AGENT_LABEL" >/dev/null 2>&1 || true
+
+# bootout returns before the job is actually gone; bootstrapping into a domain that
+# still holds the old job fails with "5: Input/output error". Wait for the removal
+# to land instead of racing it.
+for _ in $(seq 1 20); do
+  launchctl print "gui/$UID_NUM/$LVF_AGENT_LABEL" >/dev/null 2>&1 || break
+  sleep 0.5
+done
+
 launchctl enable "gui/$UID_NUM/$LVF_AGENT_LABEL" >/dev/null 2>&1 || true
 
-if launchctl bootstrap "gui/$UID_NUM" "$LVF_PLIST"; then
+# launchd can still answer with a transient I/O error right after an unload; a
+# short retry loop rides that out instead of failing the whole install.
+BOOTSTRAPPED=0
+for attempt in 1 2 3 4 5; do
+  if launchctl bootstrap "gui/$UID_NUM" "$LVF_PLIST" 2>/dev/null; then
+    BOOTSTRAPPED=1
+    break
+  fi
+  # The job may have appeared in the meantime (KeepAlive respawn of a half-removed
+  # instance): clear it and try again.
+  launchctl bootout "gui/$UID_NUM/$LVF_AGENT_LABEL" >/dev/null 2>&1 || true
+  sleep "$attempt"
+done
+
+if ((BOOTSTRAPPED)); then
   ok "bootstrapped gui/$UID_NUM/$LVF_AGENT_LABEL"
 else
-  fail "launchctl bootstrap failed"
+  # Surface the real error message on the final attempt.
+  launchctl bootstrap "gui/$UID_NUM" "$LVF_PLIST" || true
+  fail "launchctl bootstrap failed after 5 attempts"
   hint "Inspect it with: launchctl print gui/$UID_NUM/$LVF_AGENT_LABEL"
+  hint "If it persists: log out and back in (launchd's user domain can wedge), then re-run make install"
   exit 1
 fi
 
@@ -257,9 +283,10 @@ printf '  Данные:  %s\n' "$LVF_DATA_DIR"
 
 # Разрешения — единственное, что отделяет пользователя от рабочей диктовки, и
 # единственное, что нельзя сделать за него. Поэтому это последнее, что он видит.
-MIC_STATE="$(lvf_api_get "/api/status" 2>/dev/null | lvf_json_find "microphone" 2>/dev/null || true)"
-INP_STATE="$(lvf_api_get "/api/status" 2>/dev/null | lvf_json_find "inputMonitoring" 2>/dev/null || true)"
-ACC_STATE="$(lvf_api_get "/api/status" 2>/dev/null | lvf_json_find "accessibility" 2>/dev/null || true)"
+STATUS_JSON="$(lvf_api_get "/api/status" 2>/dev/null || true)"
+MIC_STATE="$(printf '%s' "$STATUS_JSON" | lvf_json_find "microphone" 2>/dev/null || true)"
+INP_STATE="$(printf '%s' "$STATUS_JSON" | lvf_json_find "inputMonitoring" 2>/dev/null || true)"
+ACC_STATE="$(printf '%s' "$STATUS_JSON" | lvf_json_find "accessibility" 2>/dev/null || true)"
 
 printf '\n'
 if [[ "$MIC_STATE" == "granted" && "$INP_STATE" == "granted" && "$ACC_STATE" == "granted" ]]; then

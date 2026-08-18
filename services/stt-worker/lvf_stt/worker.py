@@ -16,16 +16,24 @@ out a decode that nobody is going to read.
 Every stdout write goes through :meth:`Worker._write` under a lock, so a status
 event pushed during loading can never interleave with a response, and nothing at all
 is written after the ``shutdown`` acknowledgement.
+
+A **watchdog thread** guards the two places the MLX thread can block forever — the
+load (including a first-run weight download) and each decode. A thread wedged inside
+a C extension cannot be interrupted from Python, so on overrun the watchdog ends the
+process; core's worker-client sees the exit and restarts with backoff, which is the
+one recovery path that actually works.
 """
 
 from __future__ import annotations
 
 import collections
 import logging
+import os
 import queue
+import sys
 import threading
 import time
-from typing import Any, TextIO
+from typing import Any, Callable, TextIO
 
 from . import audio as audio_mod
 from . import protocol
@@ -37,13 +45,87 @@ from .engine import (
 
 log = logging.getLogger(__name__)
 
-#: How long a decode request waits for the model to finish loading before it gives
-#: up with ``model_not_loaded``. Core spawns the worker and may fire a request
-#: before the ``ready`` event arrives; a cold load measures ~4 s on an M1 Pro.
+#: Budget for the model load, applied twice: a decode request waits at most this
+#: long for loading to finish before giving up with ``model_not_loaded``, and the
+#: watchdog ends the process if the load call itself has not returned by then. A
+#: cold load measures ~4 s on an M1 Pro; the slack covers a first-run weight
+#: download, which huggingface_hub resumes across the restart core performs.
 DEFAULT_LOAD_TIMEOUT_S = 180.0
+
+#: Watchdog floor for a single decode. Core has already failed the request at its
+#: own ``requestTimeoutMs`` (120 s by default), so a decode still running this far
+#: past any realistic finish is a wedged Metal call, not slow work.
+DECODE_WATCHDOG_BASE_S = 120.0
+
+#: Extra decode budget per second of trimmed audio. large-v3-turbo decodes at well
+#: over 10x realtime on Apple Silicon, so 1x realtime of slack never fires on a
+#: legitimate decode even for the longest configurable capture.
+DECODE_WATCHDOG_PER_AUDIO_SECOND = 1.0
 
 #: Bounded memory for cancels that arrive before their target request.
 _CANCEL_HISTORY = 256
+
+
+def _exit_on_timeout(reason: str) -> None:
+    log.critical("watchdog: %s; exiting so core can restart the worker", reason)
+    try:
+        sys.stderr.flush()
+    except OSError:
+        pass
+    # os._exit, not sys.exit: the stuck thread would survive a SystemExit raised
+    # here, and nothing may run after the log line anyway.
+    os._exit(3)
+
+
+class Watchdog:
+    """Hard deadline around blocking MLX calls.
+
+    A Python thread stuck inside a C extension (a wedged Metal call, a download
+    stalled mid-transfer) cannot be interrupted or timed out from Python. The only
+    recovery that works is ending the process and letting core's supervisor
+    restart the worker, so the default ``on_timeout`` logs the reason and calls
+    ``os._exit``. Tests inject a recording handler instead.
+    """
+
+    def __init__(self, on_timeout: Callable[[str], None] | None = None) -> None:
+        self._on_timeout = on_timeout or _exit_on_timeout
+        self._cond = threading.Condition()
+        self._deadline: float | None = None
+        self._reason = ""
+        self._thread: threading.Thread | None = None
+
+    def arm(self, timeout_s: float, reason: str) -> None:
+        with self._cond:
+            self._deadline = time.monotonic() + timeout_s
+            self._reason = reason
+            if self._thread is None:
+                self._thread = threading.Thread(
+                    target=self._loop, name="lvf-watchdog", daemon=True
+                )
+                self._thread.start()
+            self._cond.notify()
+
+    def disarm(self) -> None:
+        with self._cond:
+            self._deadline = None
+            self._reason = ""
+            self._cond.notify()
+
+    def _loop(self) -> None:
+        while True:
+            with self._cond:
+                while self._deadline is None:
+                    self._cond.wait()
+                remaining = self._deadline - time.monotonic()
+                if remaining > 0:
+                    self._cond.wait(remaining)
+                    continue
+                reason = self._reason
+                self._deadline = None
+                self._reason = ""
+            # Outside the lock: the default handler never returns, and a test
+            # handler must be free to re-arm without deadlocking.
+            self._on_timeout(reason)
 
 
 class Worker:
@@ -54,11 +136,17 @@ class Worker:
         stdout: TextIO,
         *,
         load_timeout_s: float = DEFAULT_LOAD_TIMEOUT_S,
+        decode_timeout_base_s: float = DECODE_WATCHDOG_BASE_S,
+        decode_timeout_per_audio_s: float = DECODE_WATCHDOG_PER_AUDIO_SECOND,
+        watchdog: Watchdog | None = None,
     ) -> None:
         self._engine = engine
         self._stdin = stdin
         self._stdout = stdout
         self._load_timeout_s = load_timeout_s
+        self._decode_timeout_base_s = decode_timeout_base_s
+        self._decode_timeout_per_audio_s = decode_timeout_per_audio_s
+        self._watchdog = watchdog if watchdog is not None else Watchdog()
 
         self._stdout_lock = threading.Lock()
         self._state_lock = threading.Lock()
@@ -154,6 +242,10 @@ class Worker:
                 )
 
     def _load(self) -> None:
+        self._watchdog.arm(
+            self._load_timeout_s,
+            f"model load exceeded {self._load_timeout_s:.0f} s",
+        )
         try:
             self._engine.load(on_status=self._emit_status)
         except BaseException as exc:  # engine.load already traps its own failures
@@ -164,6 +256,7 @@ class Worker:
                 )
             )
         finally:
+            self._watchdog.disarm()
             # Release waiting decodes even after a catastrophic failure, so they fail
             # fast with model_not_loaded instead of hanging until the timeout.
             self._load_finished.set()
@@ -172,7 +265,9 @@ class Worker:
         while self._running:
             try:
                 line = self._stdin.readline()
-            except (KeyboardInterrupt, ValueError):
+            except (KeyboardInterrupt, OSError, ValueError):
+                # A torn-down stdin (EIO once core is gone) must end the loop the
+                # same way a closed pipe does, not crash with a traceback.
                 break
             if line == "":
                 log.info("stdin closed, exiting")
@@ -264,6 +359,16 @@ class Worker:
 
     def _handle_transcribe(self, request: protocol.TranscribeRequest) -> None:
         with self._state_lock:
+            if request.id in self._inflight:
+                # A second job would burn GPU for a response nobody can receive:
+                # membership in _inflight is the right to the single answer, so the
+                # duplicate is dropped rather than answered with an error line that
+                # core would take as the original request's terminal response.
+                log.warning(
+                    "duplicate transcribe id %s ignored; the original is still in flight",
+                    request.id,
+                )
+                return
             self._inflight.add(request.id)
         self._jobs.put(request)
 
@@ -338,6 +443,15 @@ class Worker:
             fail("cancelled", "cancelled while waiting for the model")
             return
 
+        decode_budget_s = (
+            self._decode_timeout_base_s
+            + (trim.samples.size / audio_mod.TARGET_SAMPLE_RATE)
+            * self._decode_timeout_per_audio_s
+        )
+        self._watchdog.arm(
+            decode_budget_s,
+            f"decode of request {request.id} exceeded {decode_budget_s:.0f} s",
+        )
         try:
             result = self._engine.transcribe(
                 trim.samples, request.language, request.initial_prompt
@@ -349,6 +463,8 @@ class Worker:
             log.error("decode failed for %s: %s", request.id, exc, exc_info=True)
             fail("internal", f"decode failed: {exc}")
             return
+        finally:
+            self._watchdog.disarm()
 
         text = normalize_transcript(str(result.get("text", "") or ""))
         detected = result.get("language")

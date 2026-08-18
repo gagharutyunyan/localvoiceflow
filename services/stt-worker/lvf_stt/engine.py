@@ -42,7 +42,7 @@ def normalize_transcript(text: str) -> str:
 #: Phrases Whisper emits when handed silence or noise. They come from the training
 #: corpus (YouTube subtitle credits, channel outros) and are never something a user
 #: dictated into a 1-second capture. Compared after :func:`_denylist_key`, and only
-#: consulted for audio that was very short or very quiet — see
+#: consulted for audio that was both very short *and* very quiet — see
 #: :func:`is_filler_hallucination`. Real speech is therefore never dropped.
 HALLUCINATION_DENYLIST: frozenset[str] = frozenset(
     {
@@ -67,8 +67,9 @@ HALLUCINATION_DENYLIST: frozenset[str] = frozenset(
     }
 )
 
-#: Above either of these the audio is unambiguously a real utterance and the
-#: denylist is not consulted at all.
+#: A capture is eligible for the denylist only when it is BOTH this short and this
+#: quiet. Exceeding either bound — a longer voiced span, or normal speaking level —
+#: is proof of a real utterance, so a loud short "Bye" is never eaten.
 FILLER_MAX_DURATION_MS = 1800
 FILLER_MAX_PEAK = 0.05
 
@@ -80,8 +81,8 @@ def _denylist_key(text: str) -> str:
 
 
 def is_filler_hallucination(text: str, *, duration_ms: int, peak: float) -> bool:
-    """True when a short/quiet capture produced only a known Whisper filler phrase."""
-    if duration_ms > FILLER_MAX_DURATION_MS and peak > FILLER_MAX_PEAK:
+    """True when a short *and* quiet capture produced only a known filler phrase."""
+    if duration_ms > FILLER_MAX_DURATION_MS or peak > FILLER_MAX_PEAK:
         return False
     return _denylist_key(text) in HALLUCINATION_DENYLIST
 

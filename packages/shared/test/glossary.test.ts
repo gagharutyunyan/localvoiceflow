@@ -135,6 +135,58 @@ describe("deterministic replacement", () => {
     const { text } = applyDeterministicReplacements("юзер дата обновилась", TERMS);
     assert.equal(text, "userData обновилась");
   });
+
+  test("a case-only alias below the safety floor never fires", () => {
+    // Regression: canonical "OR" with alias "or" used to bypass the guards entirely as a
+    // "casing fix" and rewrote every ordinary "or"/"id" in every dictation.
+    const { text, skipped } = applyDeterministicReplacements("choose one or the other id", [
+      term("OR", ["or"]),
+      term("ID", ["id"]),
+    ]);
+    assert.equal(text, "choose one or the other id");
+    assert.ok(skipped.includes("or"));
+    assert.ok(skipped.includes("id"));
+  });
+
+  test("a denylisted case-only alias never fires either", () => {
+    const { text, skipped } = applyDeterministicReplacements("этот стейт хранится локально", [
+      term("Стейт", ["стейт"]),
+    ]);
+    assert.equal(text, "этот стейт хранится локально");
+    assert.ok(skipped.includes("стейт"));
+  });
+
+  test("a long case-only alias still gets its casing fixed", () => {
+    const { text, hits } = applyDeterministicReplacements("пишу на javascript сейчас", [
+      term("JavaScript", ["javascript"]),
+    ]);
+    assert.equal(text, "пишу на JavaScript сейчас");
+    assert.equal(hits.length, 1);
+  });
+
+  test("decomposed unicode does not shift replacement offsets", () => {
+    // "й" typed as и + combining breve: NFC shortens the string, so indices found in the
+    // normalized haystack used to be applied one position off in the raw input.
+    const decomposed = "дизайн и юз эффект";
+    assert.notEqual(decomposed.normalize("NFC").length, decomposed.length);
+    const { text, hits } = applyDeterministicReplacements(decomposed, TERMS);
+    assert.equal(text, "дизайн и useEffect");
+    assert.equal(hits.length, 1);
+  });
+
+  test("decomposed text with no matches is returned byte-identical", () => {
+    const decomposed = "обычный текст без терминов";
+    assert.equal(applyDeterministicReplacements(decomposed, TERMS).text, decomposed);
+  });
+
+  test("text whose case-folding changes length is left untouched, not corrupted", () => {
+    // "İ" lowercases to two code units even under a Russian locale, so normalized offsets
+    // stop lining up; the pass must stand down instead of slicing at wrong positions.
+    const input = "İstanbul и юз эффект";
+    const { text, hits } = applyDeterministicReplacements(input, TERMS);
+    assert.equal(text, input);
+    assert.equal(hits.length, 0);
+  });
 });
 
 describe("glossary selection", () => {

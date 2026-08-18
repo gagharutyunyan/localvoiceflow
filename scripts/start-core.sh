@@ -55,6 +55,81 @@ fi
 mkdir -p "$DATA_DIR" "$LOGS_DIR"
 chmod 700 "$DATA_DIR" 2>/dev/null || true
 
+# Two parallel starts (this script, make start; launchd spawns node directly and
+# is covered only by the health check and the port bind) can each pass the health
+# check above before either has bound the port. Only the holder of this mkdir
+# lock may fork node. Shared with start.sh — same directory, same protocol — and
+# duplicated here because this file must run without _lib.sh. Keyed by port:
+# starts for different LVF_PORT values do not compete for anything.
+LOCK_DIR="$DATA_DIR/core.start.$PORT.lock"
+
+lock_owner() {
+  # stderr silenced before the input redirect: with `<file 2>...` the shell
+  # reports a missing file before the redirect takes effect.
+  tr -cd '0-9' 2>/dev/null <"$LOCK_DIR/pid" || true
+}
+
+lock_stale() {
+  # Stale: older than any legitimate startup (a holder waits at most ~30s for
+  # health), or the recorded owner is gone and the lock is old enough that the
+  # owner cannot still be between mkdir and writing its pid.
+  local owner now mtime age
+  now="$(date +%s)"
+  mtime="$(stat -f %m "$LOCK_DIR" 2>/dev/null || printf '%s' "$now")"
+  age=$((now - mtime))
+  ((age > 120)) && return 0
+  owner="$(lock_owner)"
+  if [[ -n "$owner" ]] && kill -0 "$owner" 2>/dev/null; then
+    return 1
+  fi
+  ((age > 30))
+}
+
+release_lock() {
+  # Only the recorded owner may remove the lock: after a steal the directory
+  # belongs to the stealer, and a path-based rm would destroy their fresh lock.
+  if [[ "$(lock_owner)" == "$$" ]]; then
+    rm -rf "$LOCK_DIR"
+  fi
+  return 0
+}
+
+acquire_lock() {
+  local deadline=$((SECONDS + 40))
+  while ((SECONDS < deadline)); do
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+      printf '%s\n' "$$" >"$LOCK_DIR/pid"
+      trap 'release_lock' EXIT
+      return 0
+    fi
+    if lock_stale; then
+      # Steal via atomic rename: a second stealer must never be able to delete
+      # the fresh lock the first stealer has just re-created.
+      if mv "$LOCK_DIR" "$LOCK_DIR.stale.$$" 2>/dev/null; then
+        rm -rf "$LOCK_DIR.stale.$$"
+      fi
+      continue
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+
+if ! acquire_lock; then
+  if healthy; then
+    log "core already listening on $PORT (a parallel start won the race)"
+    exit 0
+  fi
+  log "another core start holds $LOCK_DIR and did not finish — retry, or remove that directory"
+  exit 1
+fi
+
+# The lock was busy while we waited: whoever held it may have started core.
+if healthy; then
+  log "core already listening on $PORT"
+  exit 0
+fi
+
 cd "$REPO_ROOT"
 LVF_PORT="$PORT" nohup "$NODE_BIN" "$ENTRY" >>"$LOG_FILE" 2>&1 &
 core_pid=$!

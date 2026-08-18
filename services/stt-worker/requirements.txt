@@ -1,0 +1,10 @@
+# The dependency set scripts/bootstrap.sh installs into the worker's venv. When
+# this file exists it is preferred over the script's built-in fallback list, so
+# the caps written here are what a fresh machine actually gets. Keep it in
+# lockstep with [project.dependencies] in pyproject.toml — tests/test_worker.py
+# asserts the two lists are identical.
+#
+# mlx-whisper stays below 0.5: engine.py keeps protocol stdout pure JSON by
+# relying on 0.4.x semantics, where verbose=None is the only fully silent mode.
+mlx-whisper>=0.4.3,<0.5
+numpy>=1.26

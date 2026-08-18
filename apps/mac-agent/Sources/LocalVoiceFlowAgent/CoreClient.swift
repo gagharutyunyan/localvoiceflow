@@ -8,7 +8,8 @@ public enum PipelineStage: String, Codable, Sendable {
 /// Mirrors `ServerEvent`, narrowed to what the agent acts on.
 public enum ServerEvent: Sendable {
     case hello(version: String)
-    case pipeline(dictationId: String, stage: PipelineStage)
+    /// `text` carries the transcript on the `transcribed` stage so the HUD can show it.
+    case pipeline(dictationId: String, stage: PipelineStage, text: String?)
     case sttStatus(ready: Bool, state: String, error: String?)
     case settingsChanged
 }
@@ -443,7 +444,7 @@ public final class CoreClient {
                   let rawStage = root["stage"] as? String,
                   let stage = PipelineStage(rawValue: rawStage)
             else { return nil }
-            return .pipeline(dictationId: id, stage: stage)
+            return .pipeline(dictationId: id, stage: stage, text: root["text"] as? String)
         case "stt-status":
             return .sttStatus(
                 ready: root["ready"] as? Bool ?? false,

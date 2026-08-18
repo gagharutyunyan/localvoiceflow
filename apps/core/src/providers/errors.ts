@@ -1,4 +1,4 @@
-import { PipelineError, type ErrorCode } from "@lvf/shared";
+import { PipelineError } from "@lvf/shared";
 
 /**
  * Classifies a CLI failure into an actionable error code.
@@ -60,8 +60,4 @@ export function summarizeStderr(stderr: string, limit = 400): string {
     .filter((line) => !/token|bearer|api[_-]?key|authorization|secret/i.test(line))
     .join(" | ");
   return cleaned.length > limit ? `${cleaned.slice(0, limit)}…` : cleaned;
-}
-
-export function isErrorCode(value: unknown): value is ErrorCode {
-  return typeof value === "string";
 }

@@ -62,12 +62,32 @@ else
   say_ok "LaunchAgent not loaded"
 fi
 
+# Only ever kill a process whose command line is unmistakably this project's
+# core. Applies to the pidfile path too: after a crash the system may hand the
+# recorded pid to an unrelated process, so being alive proves nothing.
+is_core_command() {
+  case "$1" in
+    *"$LVF_REPO_ROOT/apps/core"* | *"apps/core/dist/main.js"* | *"apps/core/src/main.ts"*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 # --- pidfile ---------------------------------------------------------------
 if [[ -f "$LVF_PID_FILE" ]]; then
   CORE_PID="$(tr -cd '0-9' <"$LVF_PID_FILE")"
   if [[ -n "$CORE_PID" ]] && kill -0 "$CORE_PID" 2>/dev/null; then
-    lvf_kill_gracefully "$CORE_PID" "$GRACE_SECONDS"
-    say_ok "core stopped (pid $CORE_PID)"
+    CORE_CMD="$(lvf_process_command "$CORE_PID")"
+    if is_core_command "$CORE_CMD"; then
+      lvf_kill_gracefully "$CORE_PID" "$GRACE_SECONDS"
+      say_ok "core stopped (pid $CORE_PID)"
+    else
+      warn "pid $CORE_PID from the pidfile is an unrelated process — left alone, pidfile removed"
+      note "${CORE_CMD:-<command unavailable>}"
+    fi
   else
     say_ok "stale pidfile removed"
   fi
@@ -77,22 +97,17 @@ else
 fi
 
 # --- anything else still holding the port ----------------------------------
-# Only ever kill a process whose command line is unmistakably this project's core;
-# an unrelated process on the same port is reported, never killed.
 PORT_PID="$(lvf_port_pid "$LVF_PORT")"
 if [[ -n "$PORT_PID" ]]; then
   PORT_CMD="$(lvf_process_command "$PORT_PID")"
-  case "$PORT_CMD" in
-    *"$LVF_REPO_ROOT/apps/core"* | *"apps/core/dist/main.js"* | *"apps/core/src/main.ts"*)
-      lvf_kill_gracefully "$PORT_PID" "$GRACE_SECONDS"
-      say_ok "core on port $LVF_PORT stopped (pid $PORT_PID)"
-      ;;
-    *)
-      warn "port $LVF_PORT is held by an unrelated process (pid $PORT_PID) — left alone"
-      note "${PORT_CMD:-<command unavailable>}"
-      hint "Identify it with: lsof -nP -iTCP:$LVF_PORT -sTCP:LISTEN"
-      ;;
-  esac
+  if is_core_command "$PORT_CMD"; then
+    lvf_kill_gracefully "$PORT_PID" "$GRACE_SECONDS"
+    say_ok "core on port $LVF_PORT stopped (pid $PORT_PID)"
+  else
+    warn "port $LVF_PORT is held by an unrelated process (pid $PORT_PID) — left alone"
+    note "${PORT_CMD:-<command unavailable>}"
+    hint "Identify it with: lsof -nP -iTCP:$LVF_PORT -sTCP:LISTEN"
+  fi
 else
   say_ok "port $LVF_PORT is free"
 fi

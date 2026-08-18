@@ -12,6 +12,8 @@ from typing import TextIO
 
 from . import DEFAULT_MODEL, __version__
 
+log = logging.getLogger(__name__)
+
 LOG_LEVELS = ("error", "warn", "info", "debug")
 
 _LEVEL_MAP = {
@@ -68,7 +70,12 @@ def _claim_stdout() -> TextIO:
         )
         # sys.stdout still wraps fd 1, which now points at stderr's target.
         return stream
-    except OSError:
+    except OSError as exc:
+        log.warning(
+            "failed to shield protocol stdout (%s); stray non-JSON output on fd 1 "
+            "can now corrupt the stream core is parsing",
+            exc,
+        )
         return sys.stdout
 
 

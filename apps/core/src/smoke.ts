@@ -1,10 +1,9 @@
-import { existsSync, readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import type { CorrectionInput, ProviderId, TextCorrectionProvider } from "@lvf/shared";
 import { ClaudeCliProvider } from "./providers/claude.js";
 import { CodexCliProvider } from "./providers/codex.js";
-import { resolvePaths, ensureDirectories } from "./paths.js";
+import { resolvePaths, ensureDirectories, findRepoRoot } from "./paths.js";
 import { containsTerm, leaksTerm } from "./fixture-match.js";
 
 /**
@@ -41,15 +40,6 @@ function parseArgs(argv: readonly string[]): Args {
   return args;
 }
 
-function repoRoot(): string {
-  let dir = dirname(fileURLToPath(import.meta.url));
-  for (let i = 0; i < 6; i += 1) {
-    if (existsSync(join(dir, "pnpm-workspace.yaml"))) return dir;
-    dir = dirname(dir);
-  }
-  return process.cwd();
-}
-
 interface Fixture {
   id: string;
   raw: string;
@@ -59,7 +49,7 @@ interface Fixture {
 
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
-  const root = repoRoot();
+  const root = findRepoRoot();
   const paths = resolvePaths();
   ensureDirectories(paths);
 

@@ -154,6 +154,7 @@ export class ClaudeCliProvider implements TextCorrectionProvider {
 
   readonly #workDir: string;
   #cachedHealth: { at: number; value: ProviderHealth } | undefined;
+  #missingFlags: Promise<string[]> | undefined;
 
   constructor(options: { workDir: string }) {
     this.#workDir = options.workDir;
@@ -231,13 +232,22 @@ export class ClaudeCliProvider implements TextCorrectionProvider {
       cliPath,
       authenticated,
       apiKeyEnvPresent,
-      missingFlags: await this.#detectMissingFlags(cliPath, env),
+      missingFlags: await this.#missingFlagsOnce(cliPath, env),
       ...(version ? { version } : {}),
       ...(authDetail ? { authDetail } : {}),
       ...(error ? { error } : {}),
     };
     this.#cachedHealth = { at: Date.now(), value };
     return value;
+  }
+
+  /**
+   * Flag support cannot change under a running core, and probing spawns five
+   * subprocesses — so it happens at most once per process, lazily on first use.
+   */
+  #missingFlagsOnce(cliPath: string, env: NodeJS.ProcessEnv): Promise<string[]> {
+    this.#missingFlags ??= this.#detectMissingFlags(cliPath, env);
+    return this.#missingFlags;
   }
 
   /**
@@ -281,13 +291,11 @@ export class ClaudeCliProvider implements TextCorrectionProvider {
       throw new PipelineError("llm_cli_missing", "claude CLI not found on PATH");
     }
 
-    const health = await this.health();
-    if (!health.authenticated) {
-      throw new PipelineError(
-        "llm_not_authenticated",
-        "Claude Code is not signed in — run `claude auth login`",
-      );
-    }
+    // No health() here: it spawns up to seven subprocesses and would add seconds to
+    // every dictation. Authentication is not pre-checked either — a signed-out CLI
+    // fails the real call and classifyCliFailure maps that to llm_not_authenticated.
+    const apiKeyEnvPresent = detectApiKeyEnv();
+    const missingFlags = await this.#missingFlagsOnce(cliPath, subscriptionOnlyEnv(process.env));
 
     const promptDir = mkdtempSync(join(tmpdir(), "lvf-claude-"));
     const promptFile = join(promptDir, "system-prompt.md");
@@ -295,7 +303,7 @@ export class ClaudeCliProvider implements TextCorrectionProvider {
 
     try {
       const supported = new Set(
-        [...REQUIRED_FLAGS, ...HIDDEN_FLAGS].filter((flag) => !health.missingFlags.includes(flag)),
+        [...REQUIRED_FLAGS, ...HIDDEN_FLAGS].filter((flag) => !missingFlags.includes(flag)),
       );
       const args = buildClaudeArgs({
         model: config.model,
@@ -342,9 +350,9 @@ export class ClaudeCliProvider implements TextCorrectionProvider {
 
       const parsed = parseClaudeOutput(run.stdout);
       const warnings: string[] = [];
-      if (health.apiKeyEnvPresent.length > 0) {
+      if (apiKeyEnvPresent.length > 0) {
         warnings.push(
-          `${health.apiKeyEnvPresent.join(", ")} present in the environment; removed for this call`,
+          `${apiKeyEnvPresent.join(", ")} present in the environment; removed for this call`,
         );
       }
       const stderrSummary = summarizeStderr(run.stderr, 200);

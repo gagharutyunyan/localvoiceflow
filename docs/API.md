@@ -33,8 +33,10 @@ dictation with real latencies, last error, permission states as reported by the 
 ### `GET /api/events` (SSE)
 
 `text/event-stream`. Emits `ServerEvent` values (see `packages/shared/src/events.ts`):
-`hello`, `pipeline`, `stt-status`, `settings-changed`. Event payloads never contain user
-text — only ids, stages, durations and lengths.
+`hello`, `pipeline`, `stt-status`, `settings-changed`. The `transcribed` pipeline event
+carries the raw transcript in `text` so the agent HUD can show the user their words while
+the LLM works; SSE sits behind the same token as the history API, which already returns
+full texts. Everything else in event payloads is ids, stages, durations and lengths.
 
 ### `POST /api/dictations`
 
@@ -51,6 +53,10 @@ in headers so no multipart parsing is needed on either side:
 | `X-LVF-Audio-Duration-Ms` | duration measured by the agent |
 | `X-LVF-Peak-Amplitude` | 0..1 peak, used to reject silent captures early |
 | `X-LVF-Dictation-Id` | optional client-supplied id, so the agent can correlate SSE |
+
+A supplied id must be fresh: if it is already in flight or already present in history the
+request is refused with `409 {"error":{"code":"conflict",...}}` — a client must not retry
+a POST with the same id, it has to mint a new one per capture (the bundled agent does).
 
 Responds with `DictationOutcome`:
 
@@ -89,7 +95,9 @@ Query: `q`, `status`, `bundleId`, `llmProvider`, `llmModel`, `from`, `to`, `limi
 ### `POST /api/dictations/:id/reprocess` — body `ReprocessRequest`
 
 Re-runs correction on the stored raw transcript with the current or an explicitly chosen
-provider/model/effort/profile. Updates the record in place and returns it.
+provider/model/effort/profile. Updates the record in place and returns it. Answers
+`409 conflict` while the same id is still being processed (a live dictation or another
+reprocess).
 
 ### `GET /api/dictations/export?format=json|csv`
 ### `GET /api/dictations/:id/audio` — 404 unless audio storage was on for that record

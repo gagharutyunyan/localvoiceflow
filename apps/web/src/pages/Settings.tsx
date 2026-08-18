@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   FormattingProfileSchema,
@@ -88,17 +88,32 @@ function NumberField({
   step?: number;
   hint?: string;
 }) {
+  // The text being typed is buffered locally: a cleared field would otherwise commit
+  // Number("") === 0 immediately, silently saving 0 for a field the user meant to retype.
+  const [draft, setDraft] = useState(() => String(value));
+
+  // External updates (Revert, quick presets) must win over a stale draft, but a draft
+  // that already parses to the committed value is kept so typing is not reformatted.
+  useEffect(() => {
+    setDraft((current) => (current.trim() !== "" && Number(current) === value ? current : String(value)));
+  }, [value]);
+
   return (
     <Labeled label={label} hint={hint}>
       <input
         type="number"
-        value={value}
+        value={draft}
         min={min}
         max={max}
         step={step ?? 1}
         onChange={(event) => {
-          const parsed = Number(event.target.value);
-          if (Number.isFinite(parsed)) onChange(parsed);
+          const text = event.target.value;
+          setDraft(text);
+          const parsed = Number(text);
+          if (text.trim() !== "" && Number.isFinite(parsed)) onChange(parsed);
+        }}
+        onBlur={() => {
+          if (draft.trim() === "" || !Number.isFinite(Number(draft))) setDraft(String(value));
         }}
       />
     </Labeled>
@@ -285,11 +300,23 @@ export function Settings() {
 
   const provider = draft?.correction.provider ?? "claude-cli";
   const model = draft?.correction.model ?? "";
+  const effort = draft?.correction.effort ?? "";
 
   useEffect(() => {
     const stored = window.localStorage.getItem(`${LAST_CHECK_PREFIX}${provider}:${model}`);
     setLastCheckedAt(stored ?? undefined);
   }, [provider, model]);
+
+  // The test banner describes one exact provider/model/effort combination; once any
+  // of them changes it would vouch for a model that was never tested.
+  useEffect(() => {
+    setTestResult(undefined);
+  }, [provider, model, effort]);
+
+  // Kept current on every render so an in-flight test can tell whether the combination
+  // it started for is still the one on screen.
+  const comboRef = useRef("");
+  comboRef.current = `${provider} ${model} ${effort}`;
 
   const efforts = useMemo(() => effortsFor(provider, capabilities.data), [provider, capabilities.data]);
   const fallbackEfforts = useMemo(
@@ -372,6 +399,9 @@ export function Settings() {
   };
 
   const testModel = async () => {
+    // The fields stay editable while the test runs; a verdict for a combination the user
+    // has since changed must be dropped, not pinned under the new one.
+    const startedFor = comboRef.current;
     setTesting(true);
     setTestResult(undefined);
     try {
@@ -380,6 +410,7 @@ export function Settings() {
         model: draft.correction.model,
         effort: draft.correction.effort,
       });
+      if (comboRef.current !== startedFor) return;
       setTestResult(result);
       if (result.ok) {
         const now = new Date().toISOString();
@@ -390,6 +421,7 @@ export function Settings() {
         toast.error(result.error ?? "The model did not answer");
       }
     } catch (error) {
+      if (comboRef.current !== startedFor) return;
       setTestResult({ ok: false, error: errorMessage(error) });
       toast.error(errorMessage(error));
     } finally {

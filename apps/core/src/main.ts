@@ -1,6 +1,5 @@
 import { existsSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import {
   CORE_DEFAULT_HOST,
   CORE_DEFAULT_PORT,
@@ -15,7 +14,7 @@ import { Logger } from "./logger.js";
 import { Pipeline } from "./pipeline.js";
 import { ServerContext } from "./context.js";
 import { buildServer } from "./server.js";
-import { ensureDirectories, resolvePaths } from "./paths.js";
+import { ensureDirectories, findRepoRoot, resolvePaths } from "./paths.js";
 import { ClaudeCliProvider } from "./providers/claude.js";
 import { CodexCliProvider } from "./providers/codex.js";
 import { MockCorrectionProvider, MockSttProvider } from "./providers/mock.js";
@@ -24,22 +23,6 @@ import {
   defaultWorkerDir,
   defaultWorkerPython,
 } from "./stt/worker-client.js";
-
-/**
- * Walks up from this file to the repository root.
- * Works both from `src/` (tsx/strip-types) and from `dist/` after a build.
- */
-function findRepoRoot(): string {
-  let dir = dirname(fileURLToPath(import.meta.url));
-  for (let i = 0; i < 6; i += 1) {
-    if (existsSync(join(dir, "pnpm-workspace.yaml"))) return dir;
-    const parent = dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
-  }
-  // Installed layout: the app bundle keeps prompts/ next to the built core.
-  return resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
-}
 
 async function main(): Promise<void> {
   const repoRoot = process.env.LVF_REPO_ROOT ?? findRepoRoot();
@@ -166,11 +149,20 @@ async function main(): Promise<void> {
     guard.unref();
 
     try {
+      // Abort in-flight dictations first: `app.close()` waits for their requests, which
+      // can hold a CLI child and an STT request for seconds — longer than the guard.
+      // Each abort signals the whole CLI process tree, so nothing is orphaned even if
+      // the guard fires before the drain completes.
+      const aborted = pipeline.cancelAll();
+      if (aborted > 0) logger.info("aborted in-flight dictations", { aborted });
       // Before `app.close()`: it waits for in-flight requests, and an SSE stream never
       // completes on its own.
       closeEventStreams();
+      // Start stopping the worker now rather than after the drain: the 1.6 GB Python
+      // child must already have its termination signals when the guard force-exits.
+      const workerStopped = sttWorker?.stop();
       await app.close();
-      await sttWorker?.stop();
+      await workerStopped;
       db.close();
       await logger.close();
     } finally {

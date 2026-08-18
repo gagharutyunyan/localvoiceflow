@@ -1,9 +1,14 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
-import { buildClaudeArgs, parseClaudeOutput, sanitizeClaudeMetadata } from "../dist/providers/claude.js";
-import { buildCodexArgs, parseCodexLoginStatus, parseCodexOutput } from "../dist/providers/codex.js";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import type { CorrectionInput, ProviderConfig } from "@lvf/shared";
+import { ClaudeCliProvider, buildClaudeArgs, parseClaudeOutput, sanitizeClaudeMetadata } from "../dist/providers/claude.js";
+import { CodexCliProvider, buildCodexArgs, parseCodexLoginStatus, parseCodexOutput } from "../dist/providers/codex.js";
 import { API_KEY_ENV_VARS, detectApiKeyEnv, runCli, subscriptionOnlyEnv } from "../dist/providers/spawn.js";
 import { classifyCliFailure, summarizeStderr } from "../dist/providers/errors.js";
+import { clearExecutableCache } from "../dist/providers/which.js";
 import { containsTerm, leaksTerm } from "../dist/fixture-match.js";
 
 describe("claude command builder", () => {
@@ -386,6 +391,33 @@ describe("runCli", () => {
     assert.ok(result.durationMs < 5000, "cancellation must be prompt");
   });
 
+  test("a signal aborted before the call prevents the spawn entirely", async () => {
+    // Regression: an abort listener added to an already-fired signal never runs, so a
+    // cancellation landing before runCli left the child unsupervised — it ran to
+    // completion as if no signal had been passed at all.
+    const dir = mkdtempSync(join(tmpdir(), "lvf-preaborted-"));
+    const marker = join(dir, "ran");
+    const controller = new AbortController();
+    controller.abort();
+    try {
+      await assert.rejects(
+        runCli("/usr/bin/touch", {
+          args: [marker],
+          cwd: process.cwd(),
+          env: {},
+          timeoutMs: 5000,
+          signal: controller.signal,
+        }),
+        (error: Error & { code?: string }) => error.code === "cancelled",
+      );
+      // Give a would-be child time to run; the marker must never appear.
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      assert.ok(!existsSync(marker), "the child must never have been spawned");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test("a missing executable is reported as llm_cli_missing", async () => {
     await assert.rejects(
       runCli("/nonexistent/definitely-not-here", {
@@ -396,5 +428,178 @@ describe("runCli", () => {
       }),
       (error: Error & { code?: string }) => error.code === "llm_cli_missing",
     );
+  });
+
+  test(
+    "settles even when a grandchild escapes the process group and keeps the pipes open",
+    { skip: !existsSync("/usr/bin/perl") },
+    async () => {
+      // The grandchild calls setsid(), so the group-wide SIGTERM/SIGKILL cannot reach
+      // it, and it inherits our stdout pipe — `close` would wait its full 8 seconds.
+      const script =
+        "use POSIX; my $pid = fork(); if ($pid == 0) { POSIX::setsid(); sleep 8; exit 0 } sleep 8";
+      const startedAt = Date.now();
+      await assert.rejects(
+        runCli("/usr/bin/perl", {
+          args: ["-e", script],
+          cwd: process.cwd(),
+          env: {},
+          timeoutMs: 300,
+        }),
+        (error: Error & { code?: string }) => error.code === "llm_timeout",
+      );
+      const elapsed = Date.now() - startedAt;
+      assert.ok(elapsed < 7000, `must settle before the grandchild exits (took ${elapsed} ms)`);
+    },
+  );
+});
+
+describe("correct() hot path spawns no health probes", () => {
+  const config: ProviderConfig = {
+    model: "test-model",
+    effort: "low",
+    timeoutMs: 10_000,
+    systemPrompt: "правь текст",
+    disableThinking: true,
+  };
+  const input: CorrectionInput = {
+    rawTranscript: "сырой текст",
+    language: "ru",
+    glossary: [],
+    profile: "smart",
+  };
+
+  /** Puts a fake CLI first on PATH, runs the body, then restores everything. */
+  const withFakeCli = async (
+    name: string,
+    script: string,
+    body: (dir: string, log: string) => Promise<void>,
+  ): Promise<void> => {
+    const dir = mkdtempSync(join(tmpdir(), `lvf-fake-${name}-`));
+    const log = join(dir, "calls.log");
+    writeFileSync(join(dir, name), script.replace(/__LOG__/g, log), { mode: 0o755 });
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${dir}:${originalPath ?? ""}`;
+    clearExecutableCache();
+    try {
+      await body(dir, log);
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      clearExecutableCache();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  };
+
+  test("claude: flag probes run once per process and auth is never pre-checked", async () => {
+    // Regression: correct() used to call health() first — up to seven subprocesses
+    // (version, auth status, five flag probes) adding seconds to a routine dictation.
+    const script = [
+      "#!/bin/sh",
+      'printf \'%s\\n\' "$*" >> "__LOG__"',
+      'case "$*" in',
+      '  *--version*) echo "9.9.9 (fake)"; exit 0;;',
+      "esac",
+      "cat > /dev/null",
+      `printf '%s' '{"is_error":false,"structured_output":{"text":"ГОТОВО"}}'`,
+      "",
+    ].join("\n");
+
+    await withFakeCli("claude", script, async (dir, log) => {
+      const provider = new ClaudeCliProvider({ workDir: dir });
+
+      const first = await provider.correct(input, config);
+      assert.equal(first.finalText, "ГОТОВО");
+
+      const afterFirst = readFileSync(log, "utf8").trim().split("\n");
+      const probeCount = afterFirst.filter((line) => line.includes("--version")).length;
+      assert.equal(
+        afterFirst.filter((line) => line.startsWith("-p")).length,
+        1,
+        "exactly one real CLI call",
+      );
+      assert.ok(
+        afterFirst.every((line) => !line.includes("auth")),
+        "correct() must never spawn an auth probe",
+      );
+
+      const second = await provider.correct(input, config);
+      assert.equal(second.finalText, "ГОТОВО");
+
+      const afterSecond = readFileSync(log, "utf8").trim().split("\n");
+      assert.equal(
+        afterSecond.filter((line) => line.includes("--version")).length,
+        probeCount,
+        "flag probes must not run again",
+      );
+      assert.equal(
+        afterSecond.length,
+        afterFirst.length + 1,
+        "a warm correct() spawns exactly one process",
+      );
+    });
+  });
+
+  test("claude: an abort that precedes the spawn keeps the real CLI from starting", async () => {
+    // Regression: the awaits ahead of the spawn (executable resolution, flag probes)
+    // give Esc or shutdown a window to abort first; the real call then started anyway
+    // with a dead signal, burning a full LLM invocation after the cancellation.
+    const script = [
+      "#!/bin/sh",
+      'printf \'%s\\n\' "$*" >> "__LOG__"',
+      'case "$*" in',
+      '  *--version*) echo "9.9.9 (fake)"; exit 0;;',
+      "esac",
+      "cat > /dev/null",
+      `printf '%s' '{"is_error":false,"structured_output":{"text":"НЕ ДОЛЖНО ВЕРНУТЬСЯ"}}'`,
+      "",
+    ].join("\n");
+
+    await withFakeCli("claude", script, async (dir, log) => {
+      const provider = new ClaudeCliProvider({ workDir: dir });
+      const controller = new AbortController();
+      controller.abort();
+
+      await assert.rejects(
+        provider.correct(input, config, controller.signal),
+        (error: Error & { code?: string }) => error.code === "cancelled",
+      );
+
+      const lines = existsSync(log) ? readFileSync(log, "utf8").trim().split("\n") : [];
+      assert.equal(
+        lines.filter((line) => line.startsWith("-p")).length,
+        0,
+        "the real CLI call must never be spawned after the abort",
+      );
+    });
+  });
+
+  test("codex: correct() spawns exactly one process and no login probe", async () => {
+    const script = [
+      "#!/bin/sh",
+      'printf \'%s\\n\' "$*" >> "__LOG__"',
+      'out=""',
+      'prev=""',
+      'for a in "$@"; do',
+      '  if [ "$prev" = "-o" ]; then out="$a"; fi',
+      '  prev="$a"',
+      "done",
+      "cat > /dev/null",
+      'if [ -n "$out" ]; then printf \'%s\' \'{"text":"ОТ КОДЕКСА"}\' > "$out"; fi',
+      "exit 0",
+      "",
+    ].join("\n");
+
+    await withFakeCli("codex", script, async (dir, log) => {
+      const provider = new CodexCliProvider({ workDir: dir });
+
+      const result = await provider.correct(input, config);
+      assert.equal(result.finalText, "ОТ КОДЕКСА");
+
+      const lines = readFileSync(log, "utf8").trim().split("\n");
+      assert.equal(lines.length, 1, "no version/login/help probes in the hot path");
+      assert.ok(lines[0]!.startsWith("exec"));
+      assert.ok(!lines[0]!.includes("login"));
+    });
   });
 });

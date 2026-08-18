@@ -117,7 +117,11 @@ export function parseDictionaryCsv(text: string): z.infer<typeof DictionaryTermI
 
 export function dictionaryToCsv(terms: readonly DictionaryTerm[]): string {
   const escape = (value: unknown): string => {
-    const text = value === undefined || value === null ? "" : String(value);
+    let text = value === undefined || value === null ? "" : String(value);
+    // A cell starting with =, +, - or @ is evaluated as a formula by spreadsheet apps,
+    // so a crafted term could run code on whoever opens the export. The conventional
+    // leading apostrophe keeps the cell inert text.
+    if (/^[=+\-@]/.test(text)) text = `'${text}`;
     return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
   };
   const lines = ["canonical,aliases,category,language,notes,enabled"];

@@ -29,6 +29,12 @@ resident. Core never spawns a Python process per phrase.
 * `language`: `"auto" | "ru" | "en"`. `"auto"` means let Whisper detect it.
 * `initial_prompt`: may be an empty string. Never longer than the configured budget.
 * `audio_path`: mono 16 kHz PCM WAV. The worker does not delete it; core owns its lifetime.
+* Captures longer than 31 minutes are rejected with `error_code: "audio_invalid"`
+  before any frame is decoded (the settings schema caps `maxRecordingSeconds` at
+  1800 s; the extra minute absorbs stop latency).
+* A `transcribe` whose `id` is already in flight is dropped with a warning in the
+  stderr log — never queued a second time — so every id still receives exactly one
+  terminal response.
 
 ### `cancel`
 
@@ -127,7 +133,7 @@ and core cancels the dictation without creating a history record.
   "ok": false,
   "op": "transcribe",
   "error_code": "audio_invalid",
-  "error": "wav has 2 channels, expected mono"
+  "error": "cannot read wav '/absolute/path/to/capture.wav': [Errno 2] No such file or directory: '/absolute/path/to/capture.wav'"
 }
 ```
 
@@ -160,6 +166,12 @@ Core supervises the process. On unexpected exit it:
 * fails every in-flight request with `stt_unavailable`,
 * restarts with exponential backoff (1 s, 2 s, 4 s, capped at 30 s),
 * counts restarts and surfaces the count in `/api/status`.
+
+The worker also polices itself: a watchdog thread ends the process (exit code 3)
+when the model load overruns its budget or a single decode overruns a generous,
+audio-length-scaled deadline. A thread wedged inside Metal or a stalled download
+cannot be interrupted from Python, so a hard exit — and core's restart with
+backoff — is the recovery path.
 
 ## Silence handling
 

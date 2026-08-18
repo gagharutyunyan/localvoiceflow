@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { ReactNode } from "react";
 import { Modal } from "./Modal";
 import { Spinner } from "./Spinner";
@@ -30,13 +30,19 @@ export function ConfirmDialog({
   const [busy, setBusy] = useState(false);
   const [phrase, setPhrase] = useState("");
 
+  // The dialog stays mounted between openings, so the unlock phrase must be reset on
+  // every open/close transition — not only on the paths that happen to go through
+  // onClose (the footer Cancel button calls onCancel directly, for one).
+  useEffect(() => {
+    setPhrase("");
+  }, [open]);
+
   const locked = requirePhrase !== undefined && phrase.trim() !== requirePhrase;
 
   const confirm = async () => {
     setBusy(true);
     try {
       await onConfirm();
-      setPhrase("");
     } finally {
       setBusy(false);
     }
@@ -47,10 +53,7 @@ export function ConfirmDialog({
       open={open}
       title={title}
       onClose={() => {
-        if (!busy) {
-          setPhrase("");
-          onCancel();
-        }
+        if (!busy) onCancel();
       }}
       footer={
         <>

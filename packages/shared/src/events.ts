@@ -23,6 +23,12 @@ export const ServerEventSchema = z.discriminatedUnion("type", [
     stage: PipelineStageSchema,
     status: DictationStatusSchema,
     at: z.string(),
+    /**
+     * The transcript as of this stage — set on `transcribed` so the agent HUD can show the
+     * user their words while the LLM is still working. SSE requires the same token as the
+     * history API, which already returns full texts, so this widens no trust boundary.
+     */
+    text: z.string().optional(),
     /** Never contains user text — only lengths, codes and durations. */
     detail: z.record(z.union([z.string(), z.number(), z.boolean()])).optional(),
   }),

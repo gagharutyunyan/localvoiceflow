@@ -176,15 +176,10 @@ export function applyDeterministicReplacements(
     for (const alias of term.aliases) {
       const trimmed = alias.trim();
       if (trimmed.length === 0) continue;
-      if (normalizeForMatch(trimmed) === normalizeForMatch(term.canonical)) {
-        // Same word, different casing — handled below as a casing fix only.
-        compiled.push({
-          alias: trimmed,
-          canonical: term.canonical,
-          normalized: normalizeForMatch(trimmed),
-        });
-        continue;
-      }
+      // Case-only pairs (alias differs from the canonical form only in casing) get no
+      // exemption here: canonical "OR" with alias "or" would otherwise rewrite every
+      // ordinary "or" in every dictation. Long identifiers like "javascript" still get
+      // their casing fixed, because they pass the guards on their own.
       if (!isSafeAlias(trimmed)) {
         skipped.push(trimmed);
         continue;
@@ -201,10 +196,20 @@ export function applyDeterministicReplacements(
   compiled.sort((a, b) => b.normalized.length - a.normalized.length);
 
   const hits: ReplacementHit[] = [];
+  // NFC can merge characters (decomposed "и" + breve becomes a single "й"), so indices
+  // found in a normalized haystack do not line up with the raw input. All matching and
+  // slicing below therefore runs on one NFC copy of the text, never on `text` itself.
+  const source = text.normalize("NFC");
+  const haystack = normalizeForMatch(source);
+  // Locale-aware lowercasing can still change the length for exotic characters ("İ"
+  // lowercases to two code units); slices would then land on the wrong positions, so
+  // the deterministic pass honestly stands down instead of corrupting the text.
+  if (haystack.length !== source.length) {
+    return { text, hits, skipped };
+  }
   // `taken` marks output positions already rewritten, so a shorter alias cannot
   // chew into a longer replacement that already fired.
-  const taken: boolean[] = new Array(text.length).fill(false);
-  const haystack = normalizeForMatch(text);
+  const taken: boolean[] = new Array(source.length).fill(false);
 
   // Replacements are collected as (start, end, canonical) and applied once at the end,
   // which keeps every index referring to the original string.
@@ -220,7 +225,7 @@ export function applyDeterministicReplacements(
       from = idx + 1;
 
       // Whole-word only: never rewrite a fragment of a longer word.
-      if (isWordChar(text[idx - 1]) || isWordChar(text[end])) continue;
+      if (isWordChar(source[idx - 1]) || isWordChar(source[end])) continue;
       // Do not overlap an edit that already claimed this span.
       let overlaps = false;
       for (let i = idx; i < end; i += 1) {
@@ -246,13 +251,18 @@ export function applyDeterministicReplacements(
   let cursor = 0;
   for (const edit of edits) {
     // A match identical to the canonical form (including case) is not an edit.
-    if (text.slice(edit.start, edit.end) === edit.canonical) continue;
-    out += text.slice(cursor, edit.start);
+    if (source.slice(edit.start, edit.end) === edit.canonical) continue;
+    out += source.slice(cursor, edit.start);
     out += edit.canonical;
     cursor = edit.end;
     hits.push({ alias: edit.alias, canonical: edit.canonical, index: edit.start });
   }
-  out += text.slice(cursor);
+  // Every candidate turned out to already be canonical: return the input byte-identical
+  // rather than a silently NFC-normalized copy of it.
+  if (hits.length === 0) {
+    return { text, hits, skipped };
+  }
+  out += source.slice(cursor);
 
   return { text: out, hits, skipped };
 }

@@ -124,6 +124,40 @@ class TestReadWav(AudioTestCase):
         with self.assertRaises(audio.AudioError):
             audio.read_wav(p)
 
+    def test_truncated_data_chunk_raises_audio_error(self) -> None:
+        # Chopping one byte off the tail leaves a data chunk that is not a whole
+        # number of 16-bit samples — the classic interrupted capture.
+        p = self.path("truncated.wav")
+        write_wav(p, tone(0.2))
+        with open(p, "rb") as handle:
+            blob = handle.read()
+        with open(p, "wb") as handle:
+            handle.write(blob[:-1])
+        with self.assertRaises(audio.AudioError):
+            audio.read_wav(p)
+
+    def test_overlong_wav_is_rejected_from_the_header_alone(self) -> None:
+        # The data chunk declares far more audio than the file holds; the reader
+        # must reject on the declared duration without trying to materialise it.
+        p = self.path("overlong.wav")
+        rate = 16_000
+        declared_bytes = int((audio.MAX_WAV_SECONDS + 60) * rate) * 2
+        fmt = struct.pack("<HHIIHH", 1, 1, rate, rate * 2, 2, 16)
+        body = (
+            b"WAVE"
+            + b"fmt "
+            + struct.pack("<I", len(fmt))
+            + fmt
+            + b"data"
+            + struct.pack("<I", declared_bytes)
+            + b"\x00" * 64
+        )
+        with open(p, "wb") as handle:
+            handle.write(b"RIFF" + struct.pack("<I", len(body)) + body)
+        with self.assertRaises(audio.AudioError) as caught:
+            audio.read_wav(p)
+        self.assertIn("limit", str(caught.exception))
+
     def test_compressed_wav_raises_audio_error(self) -> None:
         # A hand-built RIFF header declaring µ-law (format tag 7).
         p = self.path("ulaw.wav")

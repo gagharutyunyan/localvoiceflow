@@ -39,12 +39,6 @@ export interface RunPipelineOptions {
   signal: AbortSignal;
 }
 
-interface Timings {
-  sttMs?: number;
-  llmMs?: number;
-  totalMs: number;
-}
-
 /** Monotonic elapsed milliseconds — wall-clock jumps must not corrupt reported latency. */
 function elapsedMs(from: bigint): number {
   return Number(process.hrtime.bigint() - from) / 1e6;
@@ -66,8 +60,22 @@ export class Pipeline {
     return true;
   }
 
-  get inflightCount(): number {
-    return this.#inflight.size;
+  /**
+   * Aborts every in-flight dictation and returns how many were signalled. Called on
+   * shutdown before the server drains, so CLI children and STT requests are torn down
+   * instead of being orphaned when the process exits.
+   */
+  cancelAll(): number {
+    let aborted = 0;
+    for (const controller of this.#inflight.values()) {
+      controller.abort();
+      aborted += 1;
+    }
+    return aborted;
+  }
+
+  isInflight(dictationId: string): boolean {
+    return this.#inflight.has(dictationId);
   }
 
   async run(options: RunPipelineOptions): Promise<DictationOutcome> {
@@ -97,7 +105,9 @@ export class Pipeline {
 
       // --- 1. Persist the capture to a temp file the worker can read -------
       mkdirSync(paths.tmpDir, { recursive: true, mode: 0o700 });
-      audioPath = join(paths.tmpDir, `${id}.wav`);
+      // The suffix keeps the temp path unique even if a client reuses a dictation id, so
+      // one capture can never overwrite another's audio mid-flight.
+      audioPath = join(paths.tmpDir, `${id}-${randomUUID()}.wav`);
       writeFileSync(audioPath, options.audio, { mode: 0o600 });
 
       const audioDurationMs = options.context.audioDurationMs ?? 0;
@@ -176,6 +186,8 @@ export class Pipeline {
         stage: "transcribed",
         status: "correcting",
         at: new Date().toISOString(),
+        // The glossary-substituted transcript, i.e. what the LLM is about to receive.
+        text: replacement.text,
         detail: { sttMs: Math.round(sttMs), chars: sttResult.rawTranscript.length },
       });
 
@@ -350,7 +362,9 @@ export class Pipeline {
       };
     } finally {
       options.signal.removeEventListener("abort", onExternalAbort);
-      this.#inflight.delete(id);
+      // Guarded delete: with a reused id, an earlier run finishing must not evict the
+      // newer run's controller, or that run would become uncancellable.
+      if (this.#inflight.get(id) === controller) this.#inflight.delete(id);
       if (audioPath) {
         rmSync(audioPath, { force: true });
       }
@@ -543,6 +557,14 @@ export class Pipeline {
     override: { provider?: string; model?: string; effort?: string; profile?: string },
   ): Promise<DictationRecord> {
     const { db } = this.#deps;
+    // A second registration for a busy id would overwrite the live controller in
+    // #inflight: cancel()/cancelAll() would then abort only the newcomer while the
+    // now-invisible run kept going, wrote its result after the cancellation and its CLI
+    // child outlived shutdown. Only synchronous code separates this check from the
+    // registration below, so the check cannot race.
+    if (this.#inflight.has(dictationId)) {
+      throw new PipelineError("internal", `dictation ${dictationId} is still being processed`);
+    }
     const record = db.getDictation(dictationId);
     if (!record) throw new PipelineError("internal", `dictation ${dictationId} not found`);
     if (!record.rawTranscript || record.rawTranscript.trim().length === 0) {
@@ -604,9 +626,7 @@ export class Pipeline {
         errorMessage: "",
       })!;
     } finally {
-      this.#inflight.delete(dictationId);
+      if (this.#inflight.get(dictationId) === controller) this.#inflight.delete(dictationId);
     }
   }
 }
-
-export type { Timings };

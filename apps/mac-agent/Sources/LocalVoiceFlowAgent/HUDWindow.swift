@@ -6,9 +6,12 @@ public enum HUDState: Equatable, Sendable {
     case hidden
     case recording(locked: Bool)
     case transcribing
-    case improving
-    case inserted
-    case copiedToClipboard(reason: String?)
+    /// The LLM is working; `transcript` is what Whisper heard, shown so the user can verify
+    /// their words before anything is inserted.
+    case improving(transcript: String?)
+    /// Insertion done; `text` is what actually went into the target field.
+    case inserted(text: String?)
+    case copiedToClipboard(reason: String?, text: String?)
     case error(String)
 }
 
@@ -25,10 +28,20 @@ final class HUDPanel: NSPanel {
 public final class HUDController {
     public var isEnabled = true
 
+    /// Compact capsule for status-only states; wide once a transcript is on screen.
+    private static let compactWidth: CGFloat = 260
+    private static let wideWidth: CGFloat = 460
+    private static let baseHeight: CGFloat = 62
+    private static let horizontalInset: CGFloat = 14
+    private static let transcriptFont = NSFont.systemFont(ofSize: 12.5)
+    private static let transcriptMaxLines = 3
+
     private var panel: HUDPanel?
     private var statusLabel: NSTextField?
     private var detailLabel: NSTextField?
+    private var transcriptLabel: NSTextField?
     private var indicator: NSView?
+    private var levelTrack: NSView?
     private var levelBar: NSView?
     private var levelWidthConstraint: NSLayoutConstraint?
 
@@ -60,6 +73,8 @@ public final class HUDController {
             statusLabel?.stringValue = locked ? "Запись (фиксация)" : "Запись"
             detailLabel?.stringValue = "0:00"
             setIndicatorColor(.systemRed)
+            setTranscript(nil)
+            setLevelTrackVisible(true)
             startDurationTimer()
 
         case .transcribing:
@@ -69,31 +84,40 @@ public final class HUDController {
             detailLabel?.stringValue = elapsedDetail()
             setIndicatorColor(.systemOrange)
             setLevel(0)
+            setTranscript(nil)
+            setLevelTrackVisible(false)
 
-        case .improving:
+        case .improving(let transcript):
             stopDurationTimer()
             ensurePanel()
             statusLabel?.stringValue = "Улучшаю текст"
             detailLabel?.stringValue = elapsedDetail()
             setIndicatorColor(.systemBlue)
             setLevel(0)
+            setTranscript(transcript)
+            setLevelTrackVisible(false)
 
-        case .inserted:
+        case .inserted(let text):
             stopDurationTimer()
             ensurePanel()
             statusLabel?.stringValue = "Вставлено"
             detailLabel?.stringValue = elapsedDetail()
             setIndicatorColor(.systemGreen)
             setLevel(0)
-            scheduleAutoHide(after: 1.2)
+            setTranscript(text)
+            setLevelTrackVisible(false)
+            // Long enough to read back a phrase, short enough not to linger.
+            scheduleAutoHide(after: text == nil ? 1.2 : 2.4)
 
-        case .copiedToClipboard(let reason):
+        case .copiedToClipboard(let reason, let text):
             stopDurationTimer()
             ensurePanel()
             statusLabel?.stringValue = reason ?? "Скопировано в буфер"
             detailLabel?.stringValue = "⌘V — вставить"
             setIndicatorColor(.systemGreen)
             setLevel(0)
+            setTranscript(text)
+            setLevelTrackVisible(false)
             scheduleAutoHide(after: 2.5)
 
         case .error(let message):
@@ -103,10 +127,12 @@ public final class HUDController {
             detailLabel?.stringValue = String(message.prefix(90))
             setIndicatorColor(.systemRed)
             setLevel(0)
+            setTranscript(nil)
+            setLevelTrackVisible(false)
             scheduleAutoHide(after: 4.0)
         }
 
-        position()
+        layoutPanel()
         panel?.orderFrontRegardless()
     }
 
@@ -129,7 +155,7 @@ public final class HUDController {
     private func ensurePanel() {
         if panel != nil { return }
 
-        let contentRect = NSRect(x: 0, y: 0, width: 260, height: 62)
+        let contentRect = NSRect(x: 0, y: 0, width: Self.compactWidth, height: Self.baseHeight)
         let panel = HUDPanel(
             contentRect: contentRect,
             styleMask: [.borderless, .nonactivatingPanel],
@@ -155,7 +181,7 @@ public final class HUDController {
         blur.wantsLayer = true
         blur.layer?.cornerRadius = 14
         blur.layer?.masksToBounds = true
-        blur.translatesAutoresizingMaskIntoConstraints = false
+        blur.autoresizingMask = [.width, .height]
 
         let dot = NSView()
         dot.wantsLayer = true
@@ -175,6 +201,15 @@ public final class HUDController {
         detail.lineBreakMode = .byTruncatingTail
         detail.translatesAutoresizingMaskIntoConstraints = false
 
+        let transcript = NSTextField(wrappingLabelWithString: "")
+        transcript.font = Self.transcriptFont
+        transcript.textColor = .labelColor
+        transcript.isSelectable = false
+        transcript.maximumNumberOfLines = Self.transcriptMaxLines
+        transcript.cell?.truncatesLastVisibleLine = true
+        transcript.translatesAutoresizingMaskIntoConstraints = false
+        transcript.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
         let levelTrack = NSView()
         levelTrack.wantsLayer = true
         levelTrack.layer?.cornerRadius = 2
@@ -191,26 +226,31 @@ public final class HUDController {
         blur.addSubview(dot)
         blur.addSubview(status)
         blur.addSubview(detail)
+        blur.addSubview(transcript)
         blur.addSubview(levelTrack)
         levelTrack.addSubview(level)
 
         let levelWidth = level.widthAnchor.constraint(equalToConstant: 0)
         NSLayoutConstraint.activate([
-            dot.leadingAnchor.constraint(equalTo: blur.leadingAnchor, constant: 14),
+            dot.leadingAnchor.constraint(equalTo: blur.leadingAnchor, constant: Self.horizontalInset),
             dot.centerYAnchor.constraint(equalTo: status.centerYAnchor),
             dot.widthAnchor.constraint(equalToConstant: 10),
             dot.heightAnchor.constraint(equalToConstant: 10),
 
             status.leadingAnchor.constraint(equalTo: dot.trailingAnchor, constant: 10),
-            status.trailingAnchor.constraint(lessThanOrEqualTo: blur.trailingAnchor, constant: -14),
+            status.trailingAnchor.constraint(lessThanOrEqualTo: blur.trailingAnchor, constant: -Self.horizontalInset),
             status.topAnchor.constraint(equalTo: blur.topAnchor, constant: 12),
 
             detail.leadingAnchor.constraint(equalTo: status.leadingAnchor),
-            detail.trailingAnchor.constraint(lessThanOrEqualTo: blur.trailingAnchor, constant: -14),
+            detail.trailingAnchor.constraint(lessThanOrEqualTo: blur.trailingAnchor, constant: -Self.horizontalInset),
             detail.topAnchor.constraint(equalTo: status.bottomAnchor, constant: 2),
 
-            levelTrack.leadingAnchor.constraint(equalTo: blur.leadingAnchor, constant: 14),
-            levelTrack.trailingAnchor.constraint(equalTo: blur.trailingAnchor, constant: -14),
+            transcript.leadingAnchor.constraint(equalTo: blur.leadingAnchor, constant: Self.horizontalInset),
+            transcript.trailingAnchor.constraint(equalTo: blur.trailingAnchor, constant: -Self.horizontalInset),
+            transcript.topAnchor.constraint(equalTo: detail.bottomAnchor, constant: 6),
+
+            levelTrack.leadingAnchor.constraint(equalTo: blur.leadingAnchor, constant: Self.horizontalInset),
+            levelTrack.trailingAnchor.constraint(equalTo: blur.trailingAnchor, constant: -Self.horizontalInset),
             levelTrack.bottomAnchor.constraint(equalTo: blur.bottomAnchor, constant: -10),
             levelTrack.heightAnchor.constraint(equalToConstant: 4),
 
@@ -223,21 +263,47 @@ public final class HUDController {
         self.panel = panel
         statusLabel = status
         detailLabel = detail
+        transcriptLabel = transcript
         indicator = dot
+        self.levelTrack = levelTrack
         levelBar = level
         levelWidthConstraint = levelWidth
     }
 
-    private func position() {
+    /// Sizes the panel to its current content and re-centres it at the bottom of the screen.
+    private func layoutPanel() {
         guard let panel else { return }
+        let text = transcriptLabel?.stringValue ?? ""
+        let width = text.isEmpty ? Self.compactWidth : Self.wideWidth
+        var height = Self.baseHeight
+        if !text.isEmpty {
+            height += Self.transcriptHeight(text, width: width - Self.horizontalInset * 2) + 6
+        }
+        panel.setContentSize(NSSize(width: width, height: height))
+
         let screen = NSScreen.main ?? NSScreen.screens.first
         guard let frame = screen?.visibleFrame else { return }
-        let size = panel.frame.size
-        let origin = NSPoint(
-            x: frame.midX - size.width / 2,
-            y: frame.minY + 96
+        panel.setFrameOrigin(NSPoint(x: frame.midX - width / 2, y: frame.minY + 96))
+    }
+
+    static func transcriptHeight(_ text: String, width: CGFloat) -> CGFloat {
+        let bounding = (text as NSString).boundingRect(
+            with: NSSize(width: width, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            attributes: [.font: transcriptFont]
         )
-        panel.setFrameOrigin(origin)
+        let lineHeight = ceil(transcriptFont.ascender - transcriptFont.descender + transcriptFont.leading)
+        return min(ceil(bounding.height), lineHeight * CGFloat(transcriptMaxLines) + 2)
+    }
+
+    private func setTranscript(_ text: String?) {
+        let trimmed = text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        transcriptLabel?.stringValue = trimmed
+        transcriptLabel?.isHidden = trimmed.isEmpty
+    }
+
+    private func setLevelTrackVisible(_ visible: Bool) {
+        levelTrack?.isHidden = !visible
     }
 
     private func setIndicatorColor(_ color: NSColor) {

@@ -35,11 +35,21 @@ final class AgentPlumbingTests: XCTestCase {
 
     func testParsesPipelineEvent() {
         let json = #"{"type":"pipeline","dictationId":"dct_1","stage":"correcting","status":"correcting","at":"x"}"#
-        guard case .pipeline(let id, let stage)? = CoreClient.parseEvent(json) else {
+        guard case .pipeline(let id, let stage, let text)? = CoreClient.parseEvent(json) else {
             return XCTFail("expected a pipeline event")
         }
         XCTAssertEqual(id, "dct_1")
         XCTAssertEqual(stage, .correcting)
+        XCTAssertNil(text)
+    }
+
+    func testParsesTheTranscriptCarriedByTheTranscribedStage() {
+        let json = #"{"type":"pipeline","dictationId":"dct_1","stage":"transcribed","status":"correcting","at":"x","text":"привет useEffect"}"#
+        guard case .pipeline(_, let stage, let text)? = CoreClient.parseEvent(json) else {
+            return XCTFail("expected a pipeline event")
+        }
+        XCTAssertEqual(stage, .transcribed)
+        XCTAssertEqual(text, "привет useEffect")
     }
 
     func testParsesSttStatusAndHello() {
@@ -88,7 +98,7 @@ final class AgentPlumbingTests: XCTestCase {
         XCTAssertNil(parser.feed(": keep-alive"))
         XCTAssertNil(parser.feed(#"data: {"type":"pipeline","dictationId":"dct_2","#))
         XCTAssertNil(parser.feed(#"data: "stage":"completed","status":"completed","at":"x"}"#))
-        guard case .pipeline(let id, let stage)? = parser.feed("") else {
+        guard case .pipeline(let id, let stage, _)? = parser.feed("") else {
             return XCTFail("a frame split across two data: lines must still parse")
         }
         XCTAssertEqual(id, "dct_2")

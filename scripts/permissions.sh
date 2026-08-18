@@ -10,9 +10,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
 source "${SCRIPT_DIR}/_lib.sh"
 
-BOLD=$'\033[1m'; DIM=$'\033[2m'; RESET=$'\033[0m'
-GREEN=$'\033[32m'; YELLOW=$'\033[33m'; RED=$'\033[31m'
-
 # ---------------------------------------------------------------------------
 # Подготовка: без core и агента состояние разрешений прочитать невозможно
 # ---------------------------------------------------------------------------
@@ -70,14 +67,70 @@ agent_online() {
   [[ "$(printf '%s' "$json" | lvf_json_find "agentConnected" 2>/dev/null)" == "true" ]]
 }
 
+restart_agent() {
+  pkill -f "${LVF_AGENT_BINARY_NAME}" >/dev/null 2>&1 || true
+  sleep 2
+  open -a "${LVF_APP_BUNDLE}" >/dev/null 2>&1 || true
+  sleep 4
+}
+
+# Приложение подписано ad-hoc, поэтому его подпись меняется при каждой пересборке.
+# TCC запоминает не имя, а подпись — и старая строка в списке перестаёт совпадать с
+# запущенным приложением. Снаружи это выглядит издевательски: галочка стоит, а доступа
+# нет, и сколько её ни переключай, ничего не изменится.
+#
+# Поэтому перед тем как просить включить переключатель, удаляем прежнюю запись. Список
+# станет пустым — это правильно: следующий запуск приложения добавит туда свежую строку,
+# которая уже соответствует тому, что реально работает.
+tcc_service_for() {
+  case "$1" in
+    microphone)      printf 'Microphone' ;;
+    inputMonitoring) printf 'ListenEvent' ;;
+    accessibility)   printf 'Accessibility' ;;
+  esac
+}
+
+drop_stale_entry() {
+  local service
+  service="$(tcc_service_for "$1")"
+  [[ -n "$service" ]] || return 0
+  tccutil reset "$service" "${LVF_BUNDLE_ID}" >/dev/null 2>&1 || true
+}
+
 # Агент опрашивает TCC раз в 5 секунд, поэтому свежее состояние приезжает не мгновенно.
+#
+# Перезапуск во время ожидания обязателен, а не для надёжности: macOS кэширует ответ
+# «Мониторинг ввода» на процесс, поэтому уже запущенное приложение продолжает видеть
+# «denied» сколько угодно долго после того, как переключатель включён. Только новый
+# процесс прочитает новое состояние — и он же заново попросит доступ, а этот запрос
+# и создаёт строку приложения в списке System Settings.
 wait_for_grant() {
-  local key="$1" deadline=$((SECONDS + 90)) state
+  local key="$1" started=$SECONDS deadline=$((SECONDS + 180)) state last_restart=$SECONDS
   while ((SECONDS < deadline)); do
     state="$(read_permission "$key")"
-    if [[ "$state" == "granted" ]]; then return 0; fi
-    sleep 2
+    if [[ "$state" == "granted" ]]; then printf '\n'; return 0; fi
+
+    # Отсчёт вслух: без него молчащая строка неотличима от зависшего скрипта.
+    printf '\r    %sжду… %sс из 180 (Enter — пропустить шаг)%s   ' \
+      "$LVF_C_DIM" "$((SECONDS - started))" "$LVF_C_RESET"
+
+    if ((SECONDS - last_restart >= 20)); then
+      last_restart=$SECONDS
+      printf '\r    %sперезапускаю приложение, чтобы оно перечитало разрешение…%s\n' "$LVF_C_DIM" "$LVF_C_RESET"
+      restart_agent
+    fi
+
+    # `read -t` instead of `sleep`: the wait stays interruptible by Enter. On a
+    # non-interactive stdin `read` returns instantly at EOF, turning this loop
+    # into a busy-loop hammering HTTP — plain sleep there, nothing to interrupt.
+    if [[ ! -t 0 ]]; then
+      sleep 2
+    elif read -r -t 2 -n 1 _skip 2>/dev/null; then
+      printf '\n    %sшаг пропущен%s\n' "$LVF_C_DIM" "$LVF_C_RESET"
+      return 1
+    fi
   done
+  printf '\n'
   return 1
 }
 
@@ -90,34 +143,55 @@ grant_step() {
   local state
   state="$(read_permission "$key")"
 
-  printf '\n%s──────────────────────────────────────────────────────────────%s\n' "$DIM" "$RESET"
-  printf '%sШаг %s из 3 — %s%s\n' "$BOLD" "$number" "$label" "$RESET"
-  printf '%s%s%s\n' "$DIM" "$why" "$RESET"
+  printf '\n%s──────────────────────────────────────────────────────────────%s\n' "$LVF_C_DIM" "$LVF_C_RESET"
+  printf '%sШаг %s из 3 — %s%s\n' "$LVF_C_BOLD" "$number" "$label" "$LVF_C_RESET"
+  printf '%s%s%s\n' "$LVF_C_DIM" "$why" "$LVF_C_RESET"
 
   if [[ "$state" == "granted" ]]; then
-    printf '%s  ✓ уже выдано — пропускаю%s\n' "$GREEN" "$RESET"
+    printf '%s  ✓ уже выдано — пропускаю%s\n' "$LVF_C_GREEN" "$LVF_C_RESET"
     return 0
   fi
 
-  printf '\n  Открываю нужную панель системных настроек…\n'
+  # Сначала убрать прежнюю запись, потом перезапустить приложение: свежий процесс просит
+  # доступ, и именно этот запрос создаёт в списке строку с актуальной подписью. Порядок
+  # важен — если сначала запустить, а потом сбросить, мы сотрём как раз то, что добавили.
+  printf '\n  Убираю прежнюю запись из списка (она могла устареть)…\n'
+  drop_stale_entry "$key"
+
+  printf '  Прошу macOS о доступе (может появиться системное окно)…\n'
+  restart_agent
+
+  printf '  Открываю нужную панель системных настроек…\n'
   open "x-apple.systempreferences:com.apple.preference.security?${pane}" >/dev/null 2>&1 || true
   sleep 2
 
-  printf '\n  %sЧто сделать в открывшемся окне:%s\n' "$BOLD" "$RESET"
-  printf '    1. Найдите в списке %sLocalVoiceFlow%s\n' "$BOLD" "$RESET"
+  printf '\n  %sЧто сделать в открывшемся окне:%s\n' "$LVF_C_BOLD" "$LVF_C_RESET"
+  printf '    1. Найдите в списке %sLocalVoiceFlow%s\n' "$LVF_C_BOLD" "$LVF_C_RESET"
   printf '    2. %s\n' "$where"
   printf '    3. Если macOS попросит пароль — введите пароль от вашей учётной записи Mac\n'
-  printf '\n  %sЕсли LocalVoiceFlow нет в списке:%s нажмите «+», затем ⌘⇧G,\n' "$BOLD" "$RESET"
-  printf '  вставьте путь и нажмите Enter:\n'
-  printf '    %s%s%s\n' "$BOLD" "${LVF_APP_BUNDLE}" "$RESET"
 
-  printf '\n  Жду, пока разрешение появится… (Ctrl+C — прервать)\n'
+  printf '\n  %sСписок пуст или LocalVoiceFlow в нём нет?%s Это бывает. Два способа:\n' "$LVF_C_BOLD" "$LVF_C_RESET"
+  printf '    %sА.%s Я открыл окно Finder с приложением — просто %sперетащите его мышью%s\n' \
+    "$LVF_C_BOLD" "$LVF_C_RESET" "$LVF_C_BOLD" "$LVF_C_RESET"
+  printf '       из Finder прямо в список в системных настройках.\n'
+  printf '    %sБ.%s Либо нажмите «+», затем ⌘⇧G, вставьте путь и Enter:\n' "$LVF_C_BOLD" "$LVF_C_RESET"
+  printf '       %s%s%s\n' "$LVF_C_BOLD" "${LVF_APP_BUNDLE}" "$LVF_C_RESET"
+
+  # Окно Finder с выделенным бандлом: перетащить мышью надёжнее, чем искать путь в
+  # диалоге выбора файла, который открывается неизвестно где.
+  open -R "${LVF_APP_BUNDLE}" >/dev/null 2>&1 || true
+
+  printf '\n  %sВключили переключатель, а тут всё ещё «жду» — это нормально:%s macOS\n' "$LVF_C_DIM" "$LVF_C_RESET"
+  printf '  %sотдаёт новое состояние только новому процессу, поэтому приложение%s\n' "$LVF_C_DIM" "$LVF_C_RESET"
+  printf '  %sперезапускается автоматически каждые 20 секунд.%s\n' "$LVF_C_DIM" "$LVF_C_RESET"
+
+  printf '\n  Жду, пока разрешение появится… (Enter — пропустить, Ctrl+C — прервать)\n'
   if wait_for_grant "$key"; then
-    printf '%s  ✓ %s — выдано%s\n' "$GREEN" "$label" "$RESET"
+    printf '%s  ✓ %s — выдано%s\n' "$LVF_C_GREEN" "$label" "$LVF_C_RESET"
     return 0
   fi
 
-  printf '%s  ✗ %s пока не выдано%s\n' "$YELLOW" "$label" "$RESET"
+  printf '%s  ✗ %s пока не выдано%s\n' "$LVF_C_YELLOW" "$label" "$LVF_C_RESET"
   hint "Проверьте, что галочка стоит именно у LocalVoiceFlow, и запустите: make permissions"
   return 1
 }
@@ -126,9 +200,9 @@ grant_step() {
 # Мастер
 # ---------------------------------------------------------------------------
 
-printf '\n%sНастройка разрешений LocalVoiceFlow%s\n' "$BOLD" "$RESET"
-printf '%sТри разрешения macOS. Без них диктовка не заработает — это защита системы,%s\n' "$DIM" "$RESET"
-printf '%sвыдать их можно только вручную.%s\n' "$DIM" "$RESET"
+printf '\n%sНастройка разрешений LocalVoiceFlow%s\n' "$LVF_C_BOLD" "$LVF_C_RESET"
+printf '%sТри разрешения macOS. Без них диктовка не заработает — это защита системы,%s\n' "$LVF_C_DIM" "$LVF_C_RESET"
+printf '%sвыдать их можно только вручную.%s\n' "$LVF_C_DIM" "$LVF_C_RESET"
 
 FAILED=0
 
@@ -148,7 +222,7 @@ grant_step 3 "Универсальный доступ" "accessibility" "Privacy_
 # Перезапуск: event tap подхватывает новые права только при старте процесса
 # ---------------------------------------------------------------------------
 
-printf '\n%s──────────────────────────────────────────────────────────────%s\n' "$DIM" "$RESET"
+printf '\n%s──────────────────────────────────────────────────────────────%s\n' "$LVF_C_DIM" "$LVF_C_RESET"
 step "Перезапуск приложения"
 note "macOS отдаёт новые права только при запуске процесса, поэтому перезапускаю"
 
@@ -186,7 +260,7 @@ esac
 # Итог
 # ---------------------------------------------------------------------------
 
-printf '\n%s──────────────────────────────────────────────────────────────%s\n' "$DIM" "$RESET"
+printf '\n%s──────────────────────────────────────────────────────────────%s\n' "$LVF_C_DIM" "$LVF_C_RESET"
 step "Проверка"
 
 sleep 3
@@ -196,8 +270,8 @@ ACC="$(read_permission accessibility)"
 
 print_state() {
   case "$2" in
-    granted) printf '  %s✓%s %-24s выдано\n' "$GREEN" "$RESET" "$1" ;;
-    *)       printf '  %s✗%s %-24s %s\n' "$RED" "$RESET" "$1" "$2" ;;
+    granted) printf '  %s✓%s %-24s выдано\n' "$LVF_C_GREEN" "$LVF_C_RESET" "$1" ;;
+    *)       printf '  %s✗%s %-24s %s\n' "$LVF_C_RED" "$LVF_C_RESET" "$1" "$2" ;;
   esac
 }
 
@@ -206,17 +280,39 @@ print_state "Мониторинг ввода" "$INP"
 print_state "Универсальный доступ" "$ACC"
 
 if [[ "$MIC" == "granted" && "$INP" == "granted" && "$ACC" == "granted" ]]; then
-  printf '\n%s  Всё готово. Можно говорить.%s\n\n' "${GREEN}${BOLD}" "$RESET"
-  printf '  %sКак проверить прямо сейчас:%s\n' "$BOLD" "$RESET"
+  printf '\n%s  Всё готово. Можно говорить.%s\n\n' "${LVF_C_GREEN}${LVF_C_BOLD}" "$LVF_C_RESET"
+  printf '  %sКак проверить прямо сейчас:%s\n' "$LVF_C_BOLD" "$LVF_C_RESET"
   printf '    1. Откройте TextEdit и создайте новый документ\n'
   printf '    2. Поставьте курсор в документ\n'
-  printf '    3. %sЗажмите Fn%s, скажите «привет это проверка диктовки», отпустите Fn\n' "$BOLD" "$RESET"
+  printf '    3. %sЗажмите Fn%s, скажите «привет это проверка диктовки», отпустите Fn\n' "$LVF_C_BOLD" "$LVF_C_RESET"
   printf '    4. Через пару секунд текст появится сам\n\n'
-  printf '  Не сработала Fn — попробуйте %s⌃⌥Space%s (резервное сочетание).\n' "$BOLD" "$RESET"
-  printf '  История и настройки: %smake dashboard%s\n\n' "$BOLD" "$RESET"
+  printf '  Не сработала Fn — попробуйте %s⌃⌥Space%s (резервное сочетание).\n' "$LVF_C_BOLD" "$LVF_C_RESET"
+  printf '  История и настройки: %smake dashboard%s\n\n' "$LVF_C_BOLD" "$LVF_C_RESET"
   exit 0
 fi
 
-printf '\n%s  Готово не полностью.%s Запустите ещё раз: %smake permissions%s\n\n' \
-  "$YELLOW" "$RESET" "$BOLD" "$RESET"
+printf '\n%s  Готово не полностью.%s\n\n' "$LVF_C_YELLOW" "$LVF_C_RESET"
+
+# Незачем держать человека в заложниках у TCC: цепочка целиком работает и без этих
+# двух разрешений. ⌃⌥Space — Carbon-хоткей, ему «Мониторинг ввода» не нужен, а без
+# «Универсального доступа» текст просто остаётся в буфере обмена.
+if [[ "$MIC" == "granted" ]]; then
+  printf '  %sНо диктовать уже можно прямо сейчас:%s\n' "${LVF_C_GREEN}${LVF_C_BOLD}" "$LVF_C_RESET"
+  printf '    1. Поставьте курсор туда, где нужен текст\n'
+  printf '    2. Нажмите %s⌃⌥Space%s, скажите фразу, нажмите %s⌃⌥Space%s ещё раз\n' \
+    "$LVF_C_BOLD" "$LVF_C_RESET" "$LVF_C_BOLD" "$LVF_C_RESET"
+  if [[ "$ACC" == "granted" ]]; then
+    printf '    3. Текст вставится сам\n'
+  else
+    printf '    3. Текст окажется в буфере обмена — нажмите %s⌘V%s\n' "$LVF_C_BOLD" "$LVF_C_RESET"
+  fi
+  printf '\n  %sЭто рабочий путь, а не заглушка.%s Разрешения нужны только для удобства:\n' \
+    "$LVF_C_DIM" "$LVF_C_RESET"
+  printf '  %sМониторинг ввода — чтобы работала клавиша Fn, Универсальный доступ —%s\n' "$LVF_C_DIM" "$LVF_C_RESET"
+  printf '  %sчтобы не нажимать ⌘V.%s\n\n' "$LVF_C_DIM" "$LVF_C_RESET"
+fi
+
+printf '  Попробовать выдать разрешения ещё раз: %smake permissions%s\n' "$LVF_C_BOLD" "$LVF_C_RESET"
+printf '  %sЕсли приложения нет в списке — перетащите его туда мышью из Finder:%s\n' "$LVF_C_DIM" "$LVF_C_RESET"
+printf '    %s%s%s\n\n' "$LVF_C_BOLD" "${LVF_APP_BUNDLE}" "$LVF_C_RESET"
 exit 1

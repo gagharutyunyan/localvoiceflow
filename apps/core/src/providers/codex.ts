@@ -146,6 +146,7 @@ export class CodexCliProvider implements TextCorrectionProvider {
 
   readonly #workDir: string;
   #cachedHealth: { at: number; value: ProviderHealth } | undefined;
+  #missingFlags: Promise<string[]> | undefined;
 
   constructor(options: { workDir: string }) {
     this.#workDir = options.workDir;
@@ -204,7 +205,9 @@ export class CodexCliProvider implements TextCorrectionProvider {
       error ??= String(loginError);
     }
 
-    const missingFlags = await this.#detectMissingFlags(cliPath, env);
+    // Flag support cannot change under a running core; probe once per process.
+    this.#missingFlags ??= this.#detectMissingFlags(cliPath, env);
+    const missingFlags = await this.#missingFlags;
 
     const value: ProviderHealth = {
       id: this.id,
@@ -254,13 +257,10 @@ export class CodexCliProvider implements TextCorrectionProvider {
       throw new PipelineError("llm_cli_missing", "codex CLI not found on PATH");
     }
 
-    const health = await this.health();
-    if (!health.authenticated) {
-      throw new PipelineError(
-        "llm_not_authenticated",
-        "Codex is not signed in — run `codex login`",
-      );
-    }
+    // No health() here: it spawns three subprocesses per cache miss and would slow every
+    // dictation. A signed-out CLI fails the real call, and classifyCliFailure already
+    // maps that failure to llm_not_authenticated.
+    const apiKeyEnvPresent = detectApiKeyEnv();
 
     // A private temp dir per call, removed in `finally`, so a concurrent dictation can
     // never read or overwrite another one's output file.
@@ -317,9 +317,9 @@ export class CodexCliProvider implements TextCorrectionProvider {
       const finalText = parseCodexOutput(fileContents, run.stdout);
 
       const warnings: string[] = [];
-      if (health.apiKeyEnvPresent.length > 0) {
+      if (apiKeyEnvPresent.length > 0) {
         warnings.push(
-          `${health.apiKeyEnvPresent.join(", ")} present in the environment; removed for this call`,
+          `${apiKeyEnvPresent.join(", ")} present in the environment; removed for this call`,
         );
       }
       const stderrSummary = summarizeStderr(run.stderr, 200);

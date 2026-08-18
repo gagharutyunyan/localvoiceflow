@@ -12,6 +12,9 @@ LVF_LIB_SOURCED=1
 
 LVF_APP_NAME="LocalVoiceFlow"
 LVF_AGENT_LABEL="com.localvoiceflow.agent"
+# CFBundleIdentifier собранного бандла: этим значением адресуется TCC (`tccutil`).
+# Совпадает с меткой launchd не случайно, но это разные вещи — не сливать в одну.
+LVF_BUNDLE_ID="com.localvoiceflow.agent"
 LVF_DATA_DIR="$HOME/Library/Application Support/$LVF_APP_NAME"
 LVF_AUDIO_DIR="$LVF_DATA_DIR/audio"
 LVF_LOGS_DIR="$HOME/Library/Logs/$LVF_APP_NAME"

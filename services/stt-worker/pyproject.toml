@@ -8,9 +8,11 @@ version = "0.1.0"
 description = "LocalVoiceFlow speech-to-text worker: a resident MLX Whisper process speaking JSON Lines."
 requires-python = ">=3.11"
 license = { text = "MIT" }
+# Mirrored in requirements.txt, which is what scripts/bootstrap.sh actually
+# installs; tests/test_worker.py keeps the two lists identical.
 dependencies = [
-    "mlx-whisper>=0.4.3",
-    "numpy",
+    "mlx-whisper>=0.4.3,<0.5",
+    "numpy>=1.26",
 ]
 
 [project.scripts]

@@ -20,6 +20,11 @@ export interface BuildServerOptions {
   ctx: ServerContext;
   /** Absolute path to the built web UI; when absent the API still works. */
   webDir?: string;
+  /**
+   * Additionally trust the Vite dev-server origin (port 5173). Defaults to `LVF_DEV=1`,
+   * so a production install never trusts a port any other local tool may be serving on.
+   */
+  allowDevOrigins?: boolean;
 }
 
 export interface BuiltServer {
@@ -57,12 +62,14 @@ export function buildServer(options: BuildServerOptions): BuiltServer {
     },
   );
 
+  // The Vite dev origin is opt-in: `make dev` does not need it (the Vite proxy rewrites
+  // Origin to core's own), so only an explicit LVF_DEV=1 — someone pointing a bare Vite
+  // server straight at core — widens the list beyond core's own origin.
+  const allowDevOrigins = options.allowDevOrigins ?? process.env.LVF_DEV === "1";
   const allowedOrigins = [
     `http://127.0.0.1:${ctx.port}`,
     `http://localhost:${ctx.port}`,
-    // The Vite dev server during `make dev`.
-    "http://127.0.0.1:5173",
-    "http://localhost:5173",
+    ...(allowDevOrigins ? ["http://127.0.0.1:5173", "http://localhost:5173"] : []),
   ];
 
   app.addHook("onRequest", async (request, reply) => {

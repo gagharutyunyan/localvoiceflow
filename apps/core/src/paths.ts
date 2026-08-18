@@ -1,6 +1,7 @@
 import { homedir } from "node:os";
-import { join } from "node:path";
-import { mkdirSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { existsSync, mkdirSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { APP_NAME } from "@lvf/shared";
 
 /**
@@ -40,9 +41,18 @@ export function ensureDirectories(paths: AppPaths): void {
   }
 }
 
-/** Repository root, derived from this file's location at runtime. */
-export function repoRoot(importMetaUrl: string): string {
-  const here = new URL(".", importMetaUrl).pathname;
-  // dist/ or src/ -> apps/core -> apps -> repo root
-  return join(here, "..", "..", "..");
+/**
+ * Walks up from this file to the repository root (marked by pnpm-workspace.yaml).
+ * Works both from `src/` (tsx/strip-types) and from `dist/` after a build.
+ */
+export function findRepoRoot(): string {
+  let dir = dirname(fileURLToPath(import.meta.url));
+  for (let i = 0; i < 6; i += 1) {
+    if (existsSync(join(dir, "pnpm-workspace.yaml"))) return dir;
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  // Installed layout: the app bundle keeps prompts/ next to the built core.
+  return resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 }

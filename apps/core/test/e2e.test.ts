@@ -1,6 +1,6 @@
 import { test, describe, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { PipelineError, type ProviderId, type TextCorrectionProvider } from "@lvf/shared";
@@ -95,7 +95,9 @@ function makeHarness(name: string): Harness {
   });
   holder.ctx = ctx;
 
-  const server = buildServer({ ctx });
+  // Pinned so the CORS assertions do not depend on an ambient LVF_DEV=1 in the
+  // developer's shell; the dev-origin test builds its own opted-in server.
+  const server = buildServer({ ctx, allowDevOrigins: false });
   return { dir, db, stt, llm, pipeline, ctx, server, paths };
 }
 
@@ -344,8 +346,12 @@ describe("end-to-end pipeline with mock providers", () => {
 
   test("SSE reports the real stages in order", async () => {
     const seen: string[] = [];
+    const texts = new Map<string, string | undefined>();
     const unsubscribe = h.ctx.events.subscribe((event) => {
-      if (event.type === "pipeline") seen.push(event.stage);
+      if (event.type === "pipeline") {
+        seen.push(event.stage);
+        texts.set(event.stage, event.text);
+      }
     });
 
     await h.server.app.inject({
@@ -361,6 +367,10 @@ describe("end-to-end pipeline with mock providers", () => {
     unsubscribe();
 
     assert.deepEqual(seen, ["received", "transcribing", "transcribed", "correcting", "completed"]);
+    // Only `transcribed` carries user text — the agent HUD shows it during correction.
+    assert.ok((texts.get("transcribed") ?? "").length > 0);
+    assert.equal(texts.get("received"), undefined);
+    assert.equal(texts.get("completed"), undefined);
   });
 
   test("audio is deleted after processing when storage is off", async () => {
@@ -376,7 +386,7 @@ describe("end-to-end pipeline with mock providers", () => {
     });
     const outcome = response.json() as { id: string };
     assert.equal(h.db.getDictation(outcome.id)?.audioPath, undefined);
-    assert.equal(existsSync(join(h.paths.tmpDir, `${outcome.id}.wav`)), false);
+    assert.equal(readdirSync(h.paths.tmpDir).length, 0, "no temp audio may remain");
   });
 
   test("audio is retained when the user turns storage on", async () => {
@@ -394,7 +404,7 @@ describe("end-to-end pipeline with mock providers", () => {
     const outcome = response.json() as { id: string };
     const stored = h.db.getDictation(outcome.id)?.audioPath;
     assert.ok(stored && existsSync(stored), "the WAV should be kept");
-    assert.equal(existsSync(join(h.paths.tmpDir, `${outcome.id}.wav`)), false, "the temp copy goes");
+    assert.equal(readdirSync(h.paths.tmpDir).length, 0, "the temp copy goes");
     h.db.patchSettings({ stt: { storeAudio: false } });
   });
 
@@ -711,6 +721,33 @@ describe("local server security", () => {
     assert.equal(response.statusCode, 403);
   });
 
+  test("the Vite dev origin is refused unless dev mode is explicitly enabled", async () => {
+    const preview = (app: Harness["server"]["app"], token: string) =>
+      app.inject({
+        method: "POST",
+        url: "/api/dictionary/preview",
+        headers: {
+          authorization: `Bearer ${token}`,
+          origin: "http://localhost:5173",
+          "content-type": "application/json",
+        },
+        payload: { rawTranscript: "просто текст" },
+      });
+
+    // The default build must treat the Vite port like any other foreign origin: on a
+    // production install anything could be listening on 5173.
+    const denied = await preview(h.server.app, h.server.token);
+    assert.equal(denied.statusCode, 403);
+
+    const dev = buildServer({ ctx: h.ctx, allowDevOrigins: true });
+    try {
+      const allowed = await preview(dev.app, dev.token);
+      assert.equal(allowed.statusCode, 200);
+    } finally {
+      await dev.app.close();
+    }
+  });
+
   test("a mutating request with neither Origin nor bearer token is refused", async () => {
     const response = await h.server.app.inject({
       method: "DELETE",
@@ -879,5 +916,182 @@ describe("CSV round-trip", () => {
     assert.equal(result.created, 0, "re-importing our own export must create nothing new");
     assert.equal(result.updated, before);
     assert.equal(h.db.listTerms().length, before);
+  });
+
+  test("formula-leading cells are neutralised so a spreadsheet cannot execute them", async () => {
+    const created = await h.server.app.inject({
+      method: "POST",
+      url: "/api/dictionary",
+      headers: { authorization: `Bearer ${h.server.token}`, "content-type": "application/json" },
+      payload: {
+        canonical: '=HYPERLINK("http://evil.example";"click")',
+        aliases: ["@evil alias", "+seven", "-minus"],
+      },
+    });
+    assert.equal(created.statusCode, 201);
+
+    const exported = await h.server.app.inject({
+      method: "GET",
+      url: "/api/dictionary/export?format=csv",
+      headers: { authorization: `Bearer ${h.server.token}` },
+    });
+    const line = exported.body.split("\n").find((row) => row.includes("HYPERLINK"));
+    assert.ok(line, "the crafted term must be present in the export");
+    assert.ok(!/^[=+\-@]/.test(line), `cell must not start with a formula character: ${line}`);
+    assert.ok(line.startsWith(`"'=`) || line.startsWith("'="), line);
+    assert.ok(line.includes("'@evil alias"), "the aliases cell is neutralised too");
+  });
+});
+
+describe("dictation id reuse, cancellation and history export safety", () => {
+  let h: Harness;
+
+  before(() => {
+    h = makeHarness("regression");
+  });
+  after(async () => {
+    await h.server.app.close();
+    h.db.close();
+    rmSync(h.dir, { recursive: true, force: true });
+  });
+
+  beforeEach(() => {
+    h.stt.configure({
+      transcript: "тестовая фраза для регрессий",
+      noSpeech: false,
+      audioDurationMs: 6200,
+    });
+    h.llm.configure({
+      failWith: undefined as unknown as Error,
+      transform: undefined,
+      latencyMs: 5,
+    });
+  });
+
+  const post = (id?: string) =>
+    h.server.app
+      .inject({
+        method: "POST",
+        url: "/api/dictations",
+        headers: {
+          "content-type": "audio/wav",
+          authorization: `Bearer ${h.server.token}`,
+          "x-lvf-audio-duration-ms": "6200",
+          ...(id ? { "x-lvf-dictation-id": id } : {}),
+        },
+        payload: makeWav(),
+      })
+      .then((response) => response);
+
+  test("a client id colliding with an in-flight dictation is rejected with 409", async () => {
+    h.llm.configure({ latencyMs: 600 });
+    const first = post("dup-id");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    const conflict = await post("dup-id");
+    assert.equal(conflict.statusCode, 409);
+    assert.equal((conflict.json() as { error: { code: string } }).error.code, "conflict");
+
+    const outcome = (await first).json() as { status: string; text: string };
+    assert.equal(outcome.status, "completed", "the original dictation must be unaffected");
+    assert.ok(outcome.text.length > 0);
+  });
+
+  test("a client id that already exists in history is rejected with 409", async () => {
+    const stored = await post("stored-id");
+    assert.equal(stored.statusCode, 200);
+    assert.equal((stored.json() as { status: string }).status, "completed");
+
+    const conflict = await post("stored-id");
+    assert.equal(conflict.statusCode, 409);
+    assert.equal((conflict.json() as { error: { code: string } }).error.code, "conflict");
+  });
+
+  test("cancelAll aborts every in-flight dictation, as shutdown requires", async () => {
+    h.llm.configure({ latencyMs: 2000 });
+    const a = post("shutdown-a");
+    const b = post("shutdown-b");
+    await new Promise((resolve) => setTimeout(resolve, 120));
+
+    assert.equal(h.pipeline.cancelAll(), 2, "both in-flight dictations must be signalled");
+
+    const [ra, rb] = await Promise.all([a, b]);
+    assert.equal((ra.json() as { status: string }).status, "cancelled");
+    assert.equal((rb.json() as { status: string }).status, "cancelled");
+    assert.equal(h.pipeline.cancelAll(), 0, "nothing may be left in flight");
+  });
+
+  test("a concurrent reprocess of a busy id is refused and the first stays cancellable", async () => {
+    const base = (await post("race-base")).json() as { id: string; status: string };
+    assert.equal(base.status, "completed");
+    const textBefore = h.db.getDictation("race-base")?.finalText;
+
+    h.llm.configure({ latencyMs: 3000 });
+    const first = h.pipeline.reprocess("race-base", {});
+    await new Promise((resolve) => setTimeout(resolve, 60));
+
+    // Regression: the second call used to overwrite the first's controller in the
+    // in-flight map, so cancel()/cancelAll() reached only the newcomer while the first
+    // run kept going invisibly and wrote its result to the DB after the user's cancel.
+    await assert.rejects(
+      h.pipeline.reprocess("race-base", {}),
+      (error: Error) => /still being processed/.test(error.message),
+    );
+
+    assert.equal(h.pipeline.isInflight("race-base"), true);
+    assert.equal(h.pipeline.cancel("race-base"), true);
+    await assert.rejects(first);
+    assert.equal(h.pipeline.cancelAll(), 0, "nothing may be left in flight");
+    assert.equal(
+      h.db.getDictation("race-base")?.finalText,
+      textBefore,
+      "a cancelled reprocess must not touch the stored text",
+    );
+  });
+
+  test("reprocess during a live dictation is refused, and Esc cancels the live run", async () => {
+    h.llm.configure({ latencyMs: 1500, transform: () => "не должно вставиться" });
+    const live = post("live-reproc");
+    // Let the pipeline reach the correction stage: rawTranscript is then already in the
+    // DB, so nothing but the in-flight guard stops a reprocess from grabbing the id.
+    await new Promise((resolve) => setTimeout(resolve, 120));
+
+    const conflict = await h.server.app.inject({
+      method: "POST",
+      url: "/api/dictations/live-reproc/reprocess",
+      headers: { authorization: `Bearer ${h.server.token}`, "content-type": "application/json" },
+      payload: {},
+    });
+    // Regression: the reprocess used to replace the live run's controller, so Esc
+    // aborted the reprocess instead and the dictation's text was inserted anyway.
+    assert.equal(conflict.statusCode, 409);
+    assert.equal((conflict.json() as { error: { code: string } }).error.code, "conflict");
+
+    assert.equal(h.pipeline.cancel("live-reproc"), true);
+    const outcome = (await live).json() as { status: string; text?: string };
+    assert.equal(outcome.status, "cancelled");
+    assert.equal(outcome.text, undefined);
+    assert.equal(h.db.getDictation("live-reproc")?.status, "cancelled");
+  });
+
+  test("history CSV export neutralises formula-leading text", async () => {
+    h.llm.configure({ transform: () => '=HYPERLINK("http://evil.example","клик")' });
+    const posted = await post("csv-formula");
+    assert.equal((posted.json() as { status: string }).status, "completed");
+
+    const exported = await h.server.app.inject({
+      method: "GET",
+      url: "/api/dictations/export?format=csv",
+      headers: { authorization: `Bearer ${h.server.token}` },
+    });
+    assert.equal(exported.statusCode, 200);
+    assert.ok(
+      exported.body.includes(`"'=HYPERLINK(`),
+      "a leading = must be prefixed with an apostrophe",
+    );
+    assert.ok(
+      !exported.body.includes(`"=HYPERLINK(`),
+      "no cell may start with a bare formula character",
+    );
   });
 });

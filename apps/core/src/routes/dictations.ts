@@ -67,7 +67,10 @@ function toCsv(records: readonly DictationRecord[]): string {
 
   const escape = (value: unknown): string => {
     if (value === undefined || value === null) return "";
-    const text = String(value);
+    let text = String(value);
+    // A leading =, +, - or @ turns a cell into a formula in Excel/Sheets; the standard
+    // apostrophe prefix makes the export inert without losing the text.
+    if (/^[=+\-@]/.test(text)) text = `'${text}`;
     return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
   };
 
@@ -105,6 +108,15 @@ export function registerDictationRoutes(app: FastifyInstance, ctx: ServerContext
     const idHeader = request.headers["x-lvf-dictation-id"];
     const dictationId =
       typeof idHeader === "string" && /^[A-Za-z0-9_-]{1,80}$/.test(idHeader) ? idHeader : undefined;
+
+    // A reused id would make two captures share one history row — and could paste one
+    // user's words into the other's field. No await sits between this check and
+    // `pipeline.run()` registering the id, so the check cannot race a concurrent POST.
+    if (dictationId && (ctx.pipeline.isInflight(dictationId) || ctx.db.getDictation(dictationId))) {
+      return reply
+        .code(409)
+        .send({ error: { code: "conflict", message: `dictation id ${dictationId} is already in use` } });
+    }
 
     const controller = new AbortController();
     // A dropped connection (the agent quit, the user cancelled) must tear the pipeline down.
@@ -192,6 +204,17 @@ export function registerDictationRoutes(app: FastifyInstance, ctx: ServerContext
     const parsed = ReprocessRequestSchema.safeParse(request.body ?? {});
     if (!parsed.success) {
       return reply.code(400).send({ error: { code: "bad_request", message: parsed.error.message } });
+    }
+    // Reprocessing an id that is still in flight (a live dictation, or an earlier
+    // reprocess) would overwrite its abort controller, so Esc would abort the wrong run.
+    // No await sits between this check and `pipeline.reprocess()` registering the id.
+    if (ctx.pipeline.isInflight(request.params.id)) {
+      return reply.code(409).send({
+        error: {
+          code: "conflict",
+          message: `dictation ${request.params.id} is still being processed`,
+        },
+      });
     }
     try {
       const record = await ctx.pipeline.reprocess(request.params.id, parsed.data);

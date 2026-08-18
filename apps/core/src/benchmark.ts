@@ -1,6 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import {
   applyDeterministicReplacements,
   selectGlossary,
@@ -13,7 +12,7 @@ import { Database } from "./db/database.js";
 import { ClaudeCliProvider } from "./providers/claude.js";
 import { CodexCliProvider } from "./providers/codex.js";
 import { MockCorrectionProvider } from "./providers/mock.js";
-import { resolvePaths, ensureDirectories } from "./paths.js";
+import { resolvePaths, ensureDirectories, findRepoRoot } from "./paths.js";
 import { containsTerm } from "./fixture-match.js";
 import {
   SttWorkerClient,
@@ -122,15 +121,6 @@ function elapsed(from: bigint): number {
   return Number(process.hrtime.bigint() - from) / 1e6;
 }
 
-function repoRoot(): string {
-  let dir = dirname(fileURLToPath(import.meta.url));
-  for (let i = 0; i < 6; i += 1) {
-    if (existsSync(join(dir, "pnpm-workspace.yaml"))) return dir;
-    dir = dirname(dir);
-  }
-  return process.cwd();
-}
-
 interface TextFixture {
   id: string;
   raw: string;
@@ -156,7 +146,7 @@ function listAudioFixtures(root: string): string[] {
 
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
-  const root = repoRoot();
+  const root = findRepoRoot();
   const paths = resolvePaths();
   ensureDirectories(paths);
 
