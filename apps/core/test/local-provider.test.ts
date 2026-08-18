@@ -318,7 +318,7 @@ describe("LocalMlxProvider", () => {
     );
   });
 
-  test("a length-capped reply carries a warning", async () => {
+  test("a length-capped reply fails instead of inserting a truncated one", async () => {
     const provider = new LocalMlxProvider({
       worker: fakeWorker({
         running: true,
@@ -327,9 +327,10 @@ describe("LocalMlxProvider", () => {
         finishReason: "length",
       }),
     });
-    const result = await provider.correct(INPUT, CONFIG);
-    assert.equal(result.warnings.length, 1);
-    assert.ok(result.warnings[0].includes("token cap"));
+    await assert.rejects(
+      provider.correct(INPUT, CONFIG),
+      (error: Error & { code?: string }) => error.code === "llm_invalid_output",
+    );
   });
 
   test("an already-aborted signal never reaches the worker", async () => {

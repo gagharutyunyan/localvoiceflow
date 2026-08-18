@@ -125,10 +125,17 @@ export class LocalMlxProvider implements TextCorrectionProvider {
       throw new PipelineError("llm_invalid_output", "the local model produced no text");
     }
 
-    const warnings: string[] = [];
+    // A reply that ran into the token cap is truncated mid-sentence. Handing that to the
+    // caller as a success would paste half a thought into the user's document and only
+    // whisper about it in a warning; failing instead lets the retry and the raw-transcript
+    // fallback do their job, and nothing the user said is lost.
     if (result.finishReason === "length") {
-      warnings.push("local model output hit the token cap; the tail may be missing");
+      throw new PipelineError(
+        "llm_invalid_output",
+        "the local model hit its token cap and returned a truncated reply",
+      );
     }
+    const warnings: string[] = [];
 
     return {
       finalText: text,

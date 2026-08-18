@@ -44,6 +44,91 @@ function elapsedMs(from: bigint): number {
   return Number(process.hrtime.bigint() - from) / 1e6;
 }
 
+/** One (provider, model, effort) combination the correction step may try. */
+interface AttemptPreset {
+  provider: ProviderId;
+  model: string;
+  effort: string;
+  disableThinking: boolean;
+}
+
+/**
+ * The presets one dictation may be tried against, in order.
+ *
+ * A fallback identical to the primary is dropped: repeating the same model with the same
+ * effort is not a fallback, it is the same call again, and the retry loop already covers
+ * that case with a shorter wait.
+ */
+function buildAttemptPresets(settings: Settings): AttemptPreset[] {
+  const { correction } = settings;
+  const presets: AttemptPreset[] = [
+    {
+      provider: correction.provider,
+      model: correction.model,
+      effort: correction.effort,
+      disableThinking: correction.disableThinking,
+    },
+  ];
+
+  if (correction.fallbackProviderEnabled) {
+    const fallback: AttemptPreset = {
+      provider: correction.fallbackProvider,
+      model: correction.fallbackModel,
+      effort: correction.fallbackEffort,
+      disableThinking: correction.fallbackDisableThinking,
+    };
+    const sameAsPrimary =
+      fallback.provider === presets[0]!.provider &&
+      fallback.model === presets[0]!.model &&
+      fallback.effort === presets[0]!.effort &&
+      fallback.disableThinking === presets[0]!.disableThinking;
+    if (!sameAsPrimary) presets.push(fallback);
+  }
+
+  return presets;
+}
+
+/**
+ * How far a failed attempt invalidates the attempts planned after it.
+ *
+ *  - `retry`     the same preset is worth another go — a network blip, a mangled JSON
+ *                envelope, a CLI that died on its own.
+ *  - `preset`    this preset is spent but another may still work: it timed out, it was
+ *                rate-limited, this subscription has no such model. Retrying a preset
+ *                that just burned a full timeout only spends the budget twice.
+ *  - `provider`  nothing on this provider can work right now (signed out, CLI not
+ *                installed), so every remaining preset that uses it is skipped as well.
+ */
+type FailureScope = "retry" | "preset" | "provider";
+
+function failureScope(error: PipelineError): FailureScope {
+  switch (error.code) {
+    case "llm_network":
+    case "llm_invalid_output":
+    case "llm_failed":
+      return "retry";
+    case "llm_not_authenticated":
+    case "llm_cli_missing":
+      return "provider";
+    default:
+      return "preset";
+  }
+}
+
+/** Abortable sleep: Esc during a retry backoff must not cost the user a full delay. */
+function delay(ms: number, signal: AbortSignal): Promise<void> {
+  if (ms <= 0 || signal.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const done = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", done);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    signal.addEventListener("abort", done, { once: true });
+  });
+}
+
 export class Pipeline {
   readonly #deps: PipelineDeps;
   readonly #inflight = new Map<string, AbortController>();
@@ -425,9 +510,18 @@ export class Pipeline {
   }
 
   /**
-   * Runs correction, optionally retrying once on a transient network error, and only
-   * crossing to the fallback provider when the user explicitly turned that on — silently
-   * moving a request to a second paid subscription would be a surprising charge.
+   * Runs the correction step, retrying and falling back until something works or the
+   * attempt budget is spent.
+   *
+   * One LLM call used to be the whole policy — a retry only for a network blip, and a
+   * single shot at the fallback. Anything else (a CLI that died, a mangled envelope, a
+   * model that thought for longer than its timeout) dropped the dictation onto the raw
+   * transcript on the first stumble. Now every preset gets its own attempts, the failure
+   * decides how far to jump, and the total is bounded by `correction.maxAttempts` so a
+   * bad run still cannot outlive the budget the agent is waiting on.
+   *
+   * Crossing to the fallback provider still requires the user to have turned it on —
+   * silently moving a request onto a second paid subscription would be a surprising charge.
    */
   async #correctWithFallback(params: {
     rawTranscript: string;
@@ -476,66 +570,81 @@ export class Pipeline {
     };
 
     const systemPrompt = this.#deps.loadSystemPrompt();
-
-    const attempts: Array<{ provider: ProviderId; model: string; effort: string }> = [
-      {
-        provider: settings.correction.provider,
-        model: settings.correction.model,
-        effort: settings.correction.effort,
-      },
-    ];
-    if (settings.correction.fallbackProviderEnabled) {
-      attempts.push({
-        provider: settings.correction.fallbackProvider,
-        model: settings.correction.fallbackModel,
-        effort: settings.correction.fallbackEffort,
-      });
-    }
+    const presets = buildAttemptPresets(settings);
+    // Every preset gets a share of the budget, so a fallback that was configured always
+    // gets to run even when the primary burns retries first.
+    const perPreset = Math.max(1, Math.ceil(settings.correction.maxAttempts / presets.length));
 
     let lastError: PipelineError = new PipelineError("llm_failed", "no provider attempted");
+    const deadProviders = new Set<ProviderId>();
+    let attemptsUsed = 0;
 
-    for (const [index, attempt] of attempts.entries()) {
-      const provider = this.#deps.providers.get(attempt.provider);
-      if (!provider) {
-        lastError = new PipelineError("llm_cli_missing", `unknown provider ${attempt.provider}`);
+    for (const [index, preset] of presets.entries()) {
+      if (attemptsUsed >= settings.correction.maxAttempts) break;
+      if (deadProviders.has(preset.provider)) {
+        log.debug("skipping preset on a provider that already failed hard", {
+          provider: preset.provider,
+          model: preset.model,
+        });
         continue;
       }
-      if (index > 0) {
-        warnings.push(`fell back to ${attempt.provider} after ${lastError.code}`);
-        this.#deps.events.publish({
-          type: "pipeline",
-          dictationId: params.dictationId,
-          stage: "correcting",
-          status: "correcting",
-          at: new Date().toISOString(),
-          detail: { fallback: true, provider: attempt.provider },
-        });
-      } else {
-        this.#deps.events.publish({
-          type: "pipeline",
-          dictationId: params.dictationId,
-          stage: "correcting",
-          status: "correcting",
-          at: new Date().toISOString(),
-          detail: { provider: attempt.provider, model: attempt.model },
-        });
+
+      const provider = this.#deps.providers.get(preset.provider);
+      if (!provider) {
+        lastError = new PipelineError("llm_cli_missing", `unknown provider ${preset.provider}`);
+        continue;
       }
 
       const config = {
-        model: attempt.model,
-        effort: attempt.effort,
+        model: preset.model,
+        effort: preset.effort,
         timeoutMs: settings.correction.timeoutMs,
         systemPrompt,
-        disableThinking: settings.correction.disableThinking,
+        disableThinking: preset.disableThinking,
       };
 
-      // At most two tries, and only when the first failure was a transient network one.
-      for (let tryIndex = 0; tryIndex < 2; tryIndex += 1) {
+      let scope: FailureScope = "retry";
+
+      for (let tryIndex = 0; tryIndex < perPreset; tryIndex += 1) {
+        if (attemptsUsed >= settings.correction.maxAttempts) break;
+        if (params.signal.aborted) {
+          return { ok: false, error: new PipelineError("cancelled", "cancelled"), warnings };
+        }
+
+        if (index > 0 && tryIndex === 0) {
+          warnings.push(`fell back to ${preset.provider}/${preset.model} after ${lastError.code}`);
+        }
+        this.#deps.events.publish({
+          type: "pipeline",
+          dictationId: params.dictationId,
+          stage: "correcting",
+          status: "correcting",
+          at: new Date().toISOString(),
+          detail: {
+            provider: preset.provider,
+            model: preset.model,
+            attempt: attemptsUsed + 1,
+            of: settings.correction.maxAttempts,
+            ...(index > 0 ? { fallback: true } : {}),
+          },
+        });
+
+        attemptsUsed += 1;
         try {
           const result = await provider.correct(input, config, params.signal);
+          const finalText = result.finalText.trim();
+          // An empty reply is a failure wearing a success costume: the words went in and
+          // nothing came back. Treated as success it silently swallowed the whole
+          // dictation — the HUD closed, nothing was pasted, and history stored a blank.
+          if (finalText.length === 0) {
+            throw new PipelineError(
+              "llm_invalid_output",
+              `${preset.provider} returned an empty correction for a ${params.rawTranscript.length}-character transcript`,
+            );
+          }
           return {
             ok: true,
-            finalText: result.finalText.trim(),
+            finalText,
             provider: result.provider,
             model: result.model,
             effort: result.effort,
@@ -552,14 +661,29 @@ export class Pipeline {
           if (pipelineError.code === "cancelled" || params.signal.aborted) {
             return { ok: false, error: new PipelineError("cancelled", "cancelled"), warnings };
           }
-          if (!pipelineError.retryable || tryIndex === 1) break;
 
-          log.warn("retrying correction after a transient network error", {
-            provider: attempt.provider,
+          scope = failureScope(pipelineError);
+          log.warn("correction attempt failed", {
+            provider: preset.provider,
+            model: preset.model,
+            attempt: attemptsUsed,
+            code: pipelineError.code,
+            scope,
           });
-          warnings.push("retried once after a network error");
+          if (scope !== "retry") break;
+
+          const isLastTry =
+            tryIndex === perPreset - 1 || attemptsUsed >= settings.correction.maxAttempts;
+          if (isLastTry) break;
+
+          warnings.push(`retried ${preset.model} after ${pipelineError.code}`);
+          // Exponential: a provider that just refused a request is more likely to accept
+          // the next one after a pause than immediately.
+          await delay(settings.correction.retryBackoffMs * 2 ** tryIndex, params.signal);
         }
       }
+
+      if (scope === "provider") deadProviders.add(preset.provider);
     }
 
     return { ok: false, error: lastError, warnings };
@@ -629,11 +753,18 @@ export class Pipeline {
         controller.signal,
       );
 
+      const finalText = result.finalText.trim();
+      // Same rule as the live pipeline: an empty reply is not a correction. Storing it
+      // would overwrite a perfectly good previous result with nothing.
+      if (finalText.length === 0) {
+        throw new PipelineError("llm_invalid_output", `${providerId} returned an empty correction`);
+      }
+
       db.markPresetOk(providerId, model, effort);
 
       return db.updateDictation(dictationId, {
         status: "completed",
-        finalText: result.finalText.trim(),
+        finalText,
         llmProvider: result.provider,
         llmModel: result.model,
         llmEffort: result.effort,

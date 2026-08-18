@@ -41,8 +41,13 @@ class ModelNotLoadedError(RuntimeError):
 def auto_max_tokens(prompt_suffix_tokens: int) -> int:
     """Cap for the reply: edited dictation is about as long as its input, so twice the
     input plus slack is generous — and it stops a runaway generation from holding the
-    pipeline for minutes."""
-    return min(2048, prompt_suffix_tokens * 2 + 256)
+    pipeline for minutes.
+
+    The ceiling is :data:`MAX_GENERATION_TOKENS`, not a tighter constant: a three-minute
+    dictation is several thousand tokens, and a cap below its own input silently cut the
+    tail off the user's text — the reply stopped mid-sentence and only a warning said so.
+    """
+    return min(MAX_GENERATION_TOKENS, prompt_suffix_tokens * 2 + 256)
 
 
 @dataclass(frozen=True)

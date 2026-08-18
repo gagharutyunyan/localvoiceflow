@@ -119,11 +119,26 @@ export const TextCorrectionSettingsSchema = z.object({
   profile: FormattingProfileSchema.default("smart"),
   /** Empty means "use prompts/transcription-editor.md as shipped". */
   customSystemPrompt: z.string().max(20_000).default(""),
+  /** Per-attempt budget. The whole correction step may cost this much per LLM call. */
   timeoutMs: z.number().int().min(1000).max(300_000).default(30_000),
+  /**
+   * How many LLM calls one dictation may cost in total, across the primary preset and
+   * the fallback. A single attempt used to mean one flaky call lost the correction and
+   * dropped the user onto the raw transcript.
+   */
+  maxAttempts: z.number().int().min(1).max(6).default(3),
+  /** Delay before retrying the same preset; doubled on each further retry. */
+  retryBackoffMs: z.number().int().min(0).max(10_000).default(400),
   fallbackProviderEnabled: z.boolean().default(false),
   fallbackProvider: ProviderIdSchema.default("openai-codex-cli"),
   fallbackModel: ModelIdSchema.default("gpt-5.6-luna"),
   fallbackEffort: EffortSchema.default("none"),
+  /**
+   * The fallback exists to rescue a dictation that the primary preset already spent its
+   * budget on, so it runs without extended thinking regardless of the primary's setting —
+   * a second slow, thinking run is exactly what the fallback is there to avoid.
+   */
+  fallbackDisableThinking: z.boolean().default(true),
   /** Number of glossary terms selected as relevant for one correction request. */
   glossaryMaxTerms: z.number().int().min(0).max(200).default(40),
   /** Off by default: the window title can leak sensitive content to the provider. */
@@ -159,14 +174,22 @@ export const SettingsSchema = z
   })
   .superRefine((value, ctx) => {
     const checks = [
-      { provider: value.correction.provider, effort: value.correction.effort, key: "effort" },
+      {
+        provider: value.correction.provider,
+        model: value.correction.model,
+        effort: value.correction.effort,
+        disableThinking: value.correction.disableThinking,
+        key: "effort",
+      },
       {
         provider: value.correction.fallbackProvider,
+        model: value.correction.fallbackModel,
         effort: value.correction.fallbackEffort,
+        disableThinking: value.correction.fallbackDisableThinking,
         key: "fallbackEffort",
       },
     ] as const;
-    for (const { provider, effort, key } of checks) {
+    for (const { provider, model, effort, disableThinking, key } of checks) {
       // "mock" exists only for tests and accepts whatever it is given.
       if (provider === "mock") continue;
       const allowed = knownEffortsFor(provider);
@@ -176,9 +199,36 @@ export const SettingsSchema = z
           path: ["correction", key],
           message: `"${effort}" is not a valid effort for ${provider}; expected one of: ${allowed.join(", ")}`,
         });
+        continue;
+      }
+      if (provider === "claude-cli" && !effortWorksWithoutThinking(model, effort, disableThinking)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["correction", key],
+          message: `Opus rejects effort "${effort}" while thinking is disabled ("output_config.effort ... is not supported when thinking is disabled on this model"). Use "high" or below, or turn thinking back on.`,
+        });
       }
     }
   });
+
+/**
+ * Whether a Claude preset can run with extended thinking switched off.
+ *
+ * Opus answers `400 output_config.effort '<x>' is not supported when thinking is disabled
+ * on this model` for the top two efforts — instantly, before any tokens are spent, so the
+ * only symptom is that every dictation fails. Haiku and Sonnet accept the same
+ * combination (verified against Claude Code 2.1.234), which is why this is keyed on the
+ * model id rather than on the effort alone.
+ */
+export function effortWorksWithoutThinking(
+  model: string,
+  effort: string,
+  disableThinking: boolean,
+): boolean {
+  if (!disableThinking) return true;
+  if (!/opus/i.test(model)) return true;
+  return effort !== "xhigh" && effort !== "max";
+}
 
 export type Settings = z.infer<typeof SettingsSchema>;
 export type GeneralSettings = Settings["general"];
@@ -199,6 +249,23 @@ export type SettingsPatch = z.infer<typeof SettingsPatchSchema>;
 
 export function defaultSettings(): Settings {
   return SettingsSchema.parse({});
+}
+
+/**
+ * Worst-case wall time one dictation may occupy, end to end.
+ *
+ * The macOS agent uses this as its HTTP timeout for `POST /api/dictations`, so it must
+ * bound everything the pipeline can legitimately spend: transcription, then up to
+ * `maxAttempts` LLM calls of `timeoutMs` each, plus the backoff between them and slack
+ * for spawning CLIs and writing the record. A client timeout below this number is the
+ * one failure mode that loses a finished dictation — the core answers into a socket
+ * nobody is listening on any more.
+ */
+export function dictationBudgetMs(settings: Settings): number {
+  const { correction, stt } = settings;
+  const backoff = correction.retryBackoffMs * Math.max(0, correction.maxAttempts - 1) * 2;
+  const budget = stt.timeoutMs + correction.timeoutMs * correction.maxAttempts + backoff + 20_000;
+  return Math.min(budget, 900_000);
 }
 
 /** Effort values the installed CLI is known to accept, for UI presets and validation hints. */

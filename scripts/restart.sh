@@ -36,11 +36,28 @@ done
 # managed install into a hand-started process.
 if ((WAS_LAUNCHD_MANAGED == 1)) && [[ -f "$LVF_PLIST" ]]; then
   step "Reloading the LaunchAgent"
-  if launchctl bootstrap "gui/$(id -u)" "$LVF_PLIST"; then
+  # `bootout` returns before launchd has finished retiring the label, and a `bootstrap`
+  # that lands in that window fails with "Input/output error" (errno 5) — which is what
+  # made every `make restart` drop the install to a hand-started core. Wait the label out
+  # instead of racing it.
+  # Only a bootstrap that actually returns 0 counts: during the teardown window the label
+  # is still printable, so asking `launchctl print` whether the job is loaded answers
+  # "yes" about a job that is on its way out.
+  BOOTSTRAPPED=0
+  for _ in $(seq 1 40); do
+    if launchctl bootstrap "gui/$(id -u)" "$LVF_PLIST" 2>/dev/null; then
+      BOOTSTRAPPED=1
+      break
+    fi
+    sleep 0.25
+  done
+  if ((BOOTSTRAPPED == 1)); then
     ok "bootstrapped $LVF_AGENT_LABEL"
   else
     fail "launchctl bootstrap failed — falling back to a hand-started core"
     hint "Inspect it with: launchctl print gui/$(id -u)/$LVF_AGENT_LABEL"
+    # Show the real error once, now that the retries are exhausted.
+    launchctl bootstrap "gui/$(id -u)" "$LVF_PLIST" || true
   fi
 fi
 

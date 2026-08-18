@@ -58,6 +58,9 @@ public struct AgentConfig: Sendable, Equatable {
     public var restoreClipboardAfterPaste = true
     public var clipboardRestoreDelayMs = 600
     public var sendWindowTitle = false
+    /// How long core may legitimately take to answer `POST /api/dictations`, per its own
+    /// timeouts and retry budget. Used verbatim as the request timeout.
+    public var requestBudgetMs: Double = 300_000
 
     public init() {}
 
@@ -102,6 +105,9 @@ public struct AgentConfig: Sendable, Equatable {
         config.restoreClipboardAfterPaste = bool(general, "restoreClipboardAfterPaste", config.restoreClipboardAfterPaste)
         config.clipboardRestoreDelayMs = Int(number(general, "clipboardRestoreDelayMs", Double(config.clipboardRestoreDelayMs)))
         config.sendWindowTitle = bool(correction, "sendWindowTitle", config.sendWindowTitle)
+        // A core too old to advertise a budget keeps the generous default rather than a
+        // guess derived from settings it may not expose.
+        config.requestBudgetMs = min(900_000, max(30_000, number(root, "requestBudgetMs", config.requestBudgetMs)))
         return config
     }
 }
@@ -154,6 +160,9 @@ public final class CoreClient {
     private let agentVersion: String
     private let lock = NSLock()
     private var cachedToken: String?
+    /// Timeout for the one request that waits on the whole pipeline. Updated from
+    /// `/api/agent/config`; see `applyRequestBudget(ms:)`.
+    private var dictationTimeout: TimeInterval = 300
 
     public init(port: Int? = nil, agentVersion: String = AgentInfo.version) {
         let resolvedPort = port
@@ -166,9 +175,14 @@ public final class CoreClient {
         self.agentVersion = agentVersion
 
         let configuration = URLSessionConfiguration.ephemeral
-        configuration.timeoutIntervalForRequest = 15
+        // NB: this is an *inactivity* timeout, and a dictation POST receives nothing at all
+        // until the whole pipeline is done — so it also bounds the total wait. At 15 s it cut
+        // off every long dictation that core was still correcting, and the finished text was
+        // delivered into a socket nobody was listening on. The short control endpoints set
+        // their own timeouts; `postDictation` sets the budget core advertises.
+        configuration.timeoutIntervalForRequest = 120
         // A long dictation plus LLM correction can legitimately take minutes.
-        configuration.timeoutIntervalForResource = 600
+        configuration.timeoutIntervalForResource = 900
         configuration.waitsForConnectivity = false
         configuration.httpShouldUsePipelining = false
         session = URLSession(configuration: configuration)
@@ -238,6 +252,7 @@ public final class CoreClient {
     ) async throws -> DictationOutcome {
         var request = URLRequest(url: baseURL.appendingPathComponent("api/dictations"))
         request.httpMethod = "POST"
+        request.timeoutInterval = currentDictationTimeout()
         try authorized(&request)
         request.setValue("audio/wav", forHTTPHeaderField: "Content-Type")
         request.setValue(mode.rawValue, forHTTPHeaderField: "X-LVF-Recording-Mode")
@@ -267,6 +282,34 @@ public final class CoreClient {
         } catch {
             throw CoreClientError.badResponse
         }
+    }
+
+    /// Adopts the budget core advertises in `/api/agent/config`, clamped to something a
+    /// human would still wait through.
+    public func applyRequestBudget(ms: Double) {
+        let seconds = min(900, max(30, ms / 1000))
+        lock.lock(); dictationTimeout = seconds; lock.unlock()
+    }
+
+    /// Synchronous on purpose: taking the lock inline in an async function is an error
+    /// under the Swift 6 language mode.
+    private func currentDictationTimeout() -> TimeInterval {
+        lock.lock(); defer { lock.unlock() }
+        return dictationTimeout
+    }
+
+    /// `GET /api/dictations/:id/outcome` — the result of a run whose POST connection died.
+    ///
+    /// Returns nil while the run is still going (HTTP 202) or when there is nothing to
+    /// recover, so the caller can poll and then give up without inventing an outcome.
+    public func fetchOutcome(id: String) async -> DictationOutcome? {
+        var request = URLRequest(url: baseURL.appendingPathComponent("api/dictations/\(id)/outcome"))
+        request.timeoutInterval = 10
+        guard (try? authorized(&request)) != nil else { return nil }
+        guard let (data, response) = try? await session.data(for: request),
+              let http = response as? HTTPURLResponse, http.statusCode == 200
+        else { return nil }
+        return try? JSONDecoder().decode(DictationOutcome.self, from: data)
     }
 
     /// `POST /api/dictations/:id/cancel`
@@ -320,8 +363,9 @@ public final class CoreClient {
         var request = URLRequest(url: baseURL.appendingPathComponent("api/events"))
         try authorized(&request)
         request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
-        // The session's own 15 s timeout is an *idle* timeout, which is what an event stream wants;
-        // a per-request timeout would cut a healthy quiet stream instead.
+        // An event stream is quiet by design, and the session-wide inactivity timeout would
+        // cut a perfectly healthy one. Core sends its own heartbeat comments, so a dead
+        // stream is noticed by the read loop ending rather than by a timer here.
         request.timeoutInterval = 24 * 60 * 60
 
         let (bytes, response) = try await session.bytes(for: request)

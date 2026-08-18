@@ -291,6 +291,77 @@ describe("end-to-end pipeline with mock providers", () => {
     assert.equal(h.stt.calls.length, callsBefore);
   });
 
+  test("a hot microphone that overshoots 0 dBFS is still transcribed", async () => {
+    // Core Audio hands out Float32 above 1.0 on some inputs, and the longer the capture
+    // the likelier one such sample is. Rejecting the upload over it threw away the only
+    // copy of a three-minute dictation.
+    const response = await h.server.app.inject({
+      method: "POST",
+      url: "/api/dictations",
+      headers: {
+        "content-type": "audio/wav",
+        authorization: `Bearer ${h.server.token}`,
+        "x-lvf-audio-duration-ms": "146491",
+        "x-lvf-peak-amplitude": "3.1850",
+        "x-lvf-recording-mode": "something-the-agent-made-up",
+        "x-lvf-app-name": "A".repeat(400),
+      },
+      payload: makeWav(1200),
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal((response.json() as { status: string }).status, "completed");
+  });
+
+  test("the outcome of a run whose connection died can be recovered by id", async () => {
+    const id = "dct_recover_1";
+    const response = await h.server.app.inject({
+      method: "POST",
+      url: "/api/dictations",
+      headers: {
+        "content-type": "audio/wav",
+        authorization: `Bearer ${h.server.token}`,
+        "x-lvf-dictation-id": id,
+        "x-lvf-audio-duration-ms": "6200",
+      },
+      payload: makeWav(),
+    });
+    const posted = response.json() as { text: string };
+
+    const recovered = await h.server.app.inject({
+      method: "GET",
+      url: `/api/dictations/${id}/outcome`,
+      headers: { authorization: `Bearer ${h.server.token}` },
+    });
+    assert.equal(recovered.statusCode, 200);
+    const outcome = recovered.json() as { status: string; text: string; isRawFallback: boolean };
+    assert.equal(outcome.status, "completed");
+    assert.equal(outcome.text, posted.text);
+    assert.equal(outcome.isRawFallback, false);
+
+    const missing = await h.server.app.inject({
+      method: "GET",
+      url: "/api/dictations/dct_never_happened/outcome",
+      headers: { authorization: `Bearer ${h.server.token}` },
+    });
+    assert.equal(missing.statusCode, 404);
+  });
+
+  test("the agent is told how long core may take before it gives up", async () => {
+    h.db.patchSettings({
+      stt: { timeoutMs: 120_000 },
+      correction: { timeoutMs: 60_000, maxAttempts: 3, retryBackoffMs: 400 },
+    });
+    const response = await h.server.app.inject({
+      method: "GET",
+      url: "/api/agent/config",
+      headers: { authorization: `Bearer ${h.server.token}` },
+    });
+    const budget = (response.json() as { requestBudgetMs: number }).requestBudgetMs;
+    // Transcription plus three LLM attempts plus backoff — an agent timing out below
+    // this loses a dictation core has already finished.
+    assert.equal(budget, 120_000 + 180_000 + 1600 + 20_000);
+  });
+
   test("an LLM failure keeps the raw transcript and records the error", async () => {
     h.llm.configure({ failWith: new PipelineError("llm_timeout", "simulated timeout") });
 
@@ -564,6 +635,205 @@ describe("fallback provider behaviour", () => {
     assert.equal(attempts, 2, "exactly one retry, no more");
   });
 
+  test("a preset is retried until the attempt budget runs out", async () => {
+    h.db.patchSettings({ correction: { fallbackProviderEnabled: false, maxAttempts: 3, retryBackoffMs: 0 } });
+    let attempts = 0;
+    const flaky = new MockCorrectionProvider({
+      transform: () => {
+        attempts += 1;
+        if (attempts < 3) throw new PipelineError("llm_invalid_output", "empty envelope");
+        return "ПОЛУЧИЛОСЬ С ТРЕТЬЕГО РАЗА";
+      },
+    });
+    h.ctx.providers.set("mock", flaky);
+
+    const response = await h.server.app.inject({
+      method: "POST",
+      url: "/api/dictations",
+      headers: {
+        "content-type": "audio/wav",
+        authorization: `Bearer ${h.server.token}`,
+        "x-lvf-audio-duration-ms": "6200",
+      },
+      payload: makeWav(),
+    });
+
+    const outcome = response.json() as { status: string; text: string };
+    assert.equal(outcome.status, "completed");
+    assert.equal(outcome.text, "ПОЛУЧИЛОСЬ С ТРЕТЬЕГО РАЗА");
+    assert.equal(attempts, 3);
+  });
+
+  test("the attempt budget is a hard cap, not a suggestion", async () => {
+    h.db.patchSettings({ correction: { fallbackProviderEnabled: false, maxAttempts: 2, retryBackoffMs: 0 } });
+    let attempts = 0;
+    const broken = new MockCorrectionProvider({
+      transform: () => {
+        attempts += 1;
+        throw new PipelineError("llm_network", "flaky", { retryable: true });
+      },
+    });
+    h.ctx.providers.set("mock", broken);
+
+    await h.server.app.inject({
+      method: "POST",
+      url: "/api/dictations",
+      headers: {
+        "content-type": "audio/wav",
+        authorization: `Bearer ${h.server.token}`,
+        "x-lvf-audio-duration-ms": "6200",
+      },
+      payload: makeWav(),
+    });
+    assert.equal(attempts, 2);
+  });
+
+  test("a timeout skips straight to the fallback instead of waiting twice", async () => {
+    h.db.patchSettings({
+      correction: {
+        fallbackProviderEnabled: true,
+        fallbackProvider: "claude-cli",
+        fallbackModel: "haiku",
+        fallbackEffort: "low",
+        maxAttempts: 3,
+        retryBackoffMs: 0,
+        disableThinking: false,
+      },
+    });
+    let primaryCalls = 0;
+    const slow = new MockCorrectionProvider({
+      transform: () => {
+        primaryCalls += 1;
+        throw new PipelineError("llm_timeout", "took too long");
+      },
+    });
+    h.ctx.providers.set("mock", slow);
+    const secondary = new MockCorrectionProvider({ transform: () => "СПАСЁННЫЙ ТЕКСТ" });
+    h.ctx.providers.set("claude-cli", secondary);
+
+    const response = await h.server.app.inject({
+      method: "POST",
+      url: "/api/dictations",
+      headers: {
+        "content-type": "audio/wav",
+        authorization: `Bearer ${h.server.token}`,
+        "x-lvf-audio-duration-ms": "6200",
+      },
+      payload: makeWav(),
+    });
+
+    const outcome = response.json() as { status: string; text: string };
+    assert.equal(outcome.status, "completed");
+    assert.equal(outcome.text, "СПАСЁННЫЙ ТЕКСТ");
+    assert.equal(primaryCalls, 1, "the preset that just burned a full timeout is not repeated");
+    // The rescue run must not spend its budget thinking, whatever the primary asked for.
+    assert.equal(secondary.calls[0]?.config.disableThinking, true);
+  });
+
+  test("a provider that is signed out is not tried again through the fallback", async () => {
+    h.db.patchSettings({
+      correction: {
+        fallbackProviderEnabled: true,
+        fallbackProvider: "mock",
+        fallbackModel: "other-model",
+        fallbackEffort: "low",
+        maxAttempts: 3,
+        retryBackoffMs: 0,
+      },
+    });
+    let attempts = 0;
+    const signedOut = new MockCorrectionProvider({
+      transform: () => {
+        attempts += 1;
+        throw new PipelineError("llm_not_authenticated", "signed out");
+      },
+    });
+    h.ctx.providers.set("mock", signedOut);
+
+    await h.server.app.inject({
+      method: "POST",
+      url: "/api/dictations",
+      headers: {
+        "content-type": "audio/wav",
+        authorization: `Bearer ${h.server.token}`,
+        "x-lvf-audio-duration-ms": "6200",
+      },
+      payload: makeWav(),
+    });
+    assert.equal(attempts, 1, "a second preset on the same signed-out CLI cannot work either");
+  });
+
+  test("a fallback identical to the primary is not a fallback", async () => {
+    h.db.patchSettings({
+      correction: {
+        provider: "mock",
+        model: "mock-model",
+        effort: "low",
+        disableThinking: true,
+        fallbackProviderEnabled: true,
+        fallbackProvider: "mock",
+        fallbackModel: "mock-model",
+        fallbackEffort: "low",
+        fallbackDisableThinking: true,
+        maxAttempts: 4,
+        retryBackoffMs: 0,
+      },
+    });
+    let attempts = 0;
+    const dead = new MockCorrectionProvider({
+      transform: () => {
+        attempts += 1;
+        throw new PipelineError("llm_model_unavailable", "no such model");
+      },
+    });
+    h.ctx.providers.set("mock", dead);
+
+    await h.server.app.inject({
+      method: "POST",
+      url: "/api/dictations",
+      headers: {
+        "content-type": "audio/wav",
+        authorization: `Bearer ${h.server.token}`,
+        "x-lvf-audio-duration-ms": "6200",
+      },
+      payload: makeWav(),
+    });
+    assert.equal(attempts, 1, "the same preset under another name is still the same call");
+  });
+
+  test("an empty correction is a failure, not a silently blank dictation", async () => {
+    h.db.patchSettings({
+      correction: { fallbackProviderEnabled: false, maxAttempts: 2, retryBackoffMs: 0 },
+      general: { insertRawTranscriptWhenLlmFails: true },
+    });
+    let attempts = 0;
+    const mute = new MockCorrectionProvider({
+      transform: () => {
+        attempts += 1;
+        return "   ";
+      },
+    });
+    h.ctx.providers.set("mock", mute);
+    h.stt.configure({ transcript: "проверка пустого ответа", noSpeech: false });
+
+    const response = await h.server.app.inject({
+      method: "POST",
+      url: "/api/dictations",
+      headers: {
+        "content-type": "audio/wav",
+        authorization: `Bearer ${h.server.token}`,
+        "x-lvf-audio-duration-ms": "6200",
+      },
+      payload: makeWav(),
+    });
+
+    const outcome = response.json() as { status: string; text: string; isRawFallback: boolean };
+    assert.equal(attempts, 2, "an empty reply is retried like any other bad output");
+    assert.equal(outcome.status, "failed");
+    assert.equal(outcome.isRawFallback, true);
+    assert.ok(outcome.text.includes("проверка пустого ответа"), "the user's words survive");
+  });
+
   test("a non-retryable error is never retried", async () => {
     let attempts = 0;
     const failing = new MockCorrectionProvider({
@@ -690,6 +960,33 @@ describe("local server security", () => {
       })
       .then((r) => r);
     assert.notEqual((after.json() as { correction: { effort: string } }).correction.effort, "minimal");
+  });
+
+  test("opus with a top effort and thinking off is refused before it can fail every dictation", async () => {
+    const rejected = await h.server.app.inject({
+      method: "PATCH",
+      url: "/api/settings",
+      headers: { authorization: `Bearer ${h.server.token}`, "content-type": "application/json" },
+      payload: {
+        correction: { provider: "claude-cli", model: "opus", effort: "max", disableThinking: true },
+      },
+    });
+    assert.equal(rejected.statusCode, 400);
+    assert.match(rejected.body, /thinking/i);
+
+    // The same effort is fine on Sonnet, and fine on Opus once thinking is back on.
+    for (const patch of [
+      { provider: "claude-cli", model: "sonnet", effort: "max", disableThinking: true },
+      { provider: "claude-cli", model: "opus", effort: "max", disableThinking: false },
+    ]) {
+      const accepted = await h.server.app.inject({
+        method: "PATCH",
+        url: "/api/settings",
+        headers: { authorization: `Bearer ${h.server.token}`, "content-type": "application/json" },
+        payload: { correction: patch },
+      });
+      assert.equal(accepted.statusCode, 200, JSON.stringify(patch));
+    }
   });
 
   test("an effort valid for the selected provider is accepted", async () => {

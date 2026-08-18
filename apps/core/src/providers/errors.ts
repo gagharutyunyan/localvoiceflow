@@ -33,7 +33,18 @@ export function classifyCliFailure(
     return new PipelineError("llm_rate_limited", "the provider rate-limited or exhausted the quota");
   }
 
-  if (matches("unsupported_value", "model not found", "unknown model", "does not exist", "invalid model", "not supported with the")) {
+  if (
+    matches(
+      "unsupported_value",
+      "model not found",
+      "unknown model",
+      "does not exist",
+      "invalid model",
+      "not supported with the",
+      // "effort 'max' is not supported when thinking is disabled on this model"
+      "is not supported when",
+    )
+  ) {
     return new PipelineError(
       "llm_model_unavailable",
       "the selected model or effort is not available to this subscription",

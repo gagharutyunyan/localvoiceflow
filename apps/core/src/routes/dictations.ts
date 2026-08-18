@@ -3,6 +3,7 @@ import { z } from "zod";
 import {
   DictationContextSchema,
   HistoryQuerySchema,
+  RecordingModeSchema,
   ReprocessRequestSchema,
   type DictationRecord,
 } from "@lvf/shared";
@@ -12,32 +13,43 @@ import type { ServerContext } from "../context.js";
 const BulkDeleteSchema = z.object({ ids: z.array(z.string().max(80)).max(1000) });
 const EditSchema = z.object({ finalText: z.string().max(200_000) });
 
-/** Headers carry metadata so the body can be the raw WAV with no multipart parsing. */
+/**
+ * Headers carry metadata so the body can be the raw WAV with no multipart parsing.
+ *
+ * Every field here is advisory — the window title, the peak level, the reported duration.
+ * The audio is not: it exists exactly once and cannot be re-recorded. So each value is
+ * normalised into the range the schema accepts instead of being validated against it; a
+ * header the agent got wrong must never cost the user a three-minute dictation.
+ */
 function readContext(headers: Record<string, unknown>) {
   const get = (name: string): string | undefined => {
     const value = headers[name];
     return typeof value === "string" && value.length > 0 ? value : undefined;
   };
-  const decode = (value: string | undefined): string | undefined => {
+  const decode = (value: string | undefined, limit: number): string | undefined => {
     if (value === undefined) return undefined;
+    let text = value;
     try {
-      return decodeURIComponent(value);
+      text = decodeURIComponent(value);
     } catch {
-      return value;
+      // Not percent-encoded (or malformed) — take it literally.
     }
+    return text.slice(0, limit);
   };
   const num = (value: string | undefined): number | undefined => {
     if (value === undefined) return undefined;
     const parsed = Number(value);
-    return Number.isFinite(parsed) ? parsed : undefined;
+    return Number.isFinite(parsed) ? Math.max(0, parsed) : undefined;
   };
+  const mode = get("x-lvf-recording-mode");
+  const pid = num(get("x-lvf-pid"));
 
   return DictationContextSchema.parse({
-    recordingMode: get("x-lvf-recording-mode") ?? "push-to-talk",
-    appName: decode(get("x-lvf-app-name")),
-    bundleId: get("x-lvf-bundle-id"),
-    windowTitle: decode(get("x-lvf-window-title")),
-    pid: num(get("x-lvf-pid")),
+    recordingMode: RecordingModeSchema.safeParse(mode).success ? mode : "push-to-talk",
+    appName: decode(get("x-lvf-app-name"), 200),
+    bundleId: decode(get("x-lvf-bundle-id"), 200),
+    windowTitle: decode(get("x-lvf-window-title"), 500),
+    ...(pid !== undefined ? { pid: Math.floor(pid) } : {}),
     audioDurationMs: num(get("x-lvf-audio-duration-ms")),
     peakAmplitude: num(get("x-lvf-peak-amplitude")),
   });
@@ -81,6 +93,37 @@ function toCsv(records: readonly DictationRecord[]): string {
   return lines.join("\n");
 }
 
+/**
+ * Projects a stored record back onto the outcome shape the agent inserts from.
+ *
+ * A record whose run was torn down mid-flight (the agent's connection dropped) still
+ * holds the transcript, so the words are recoverable even though the corrected text is
+ * not — but only when the user asked for that fallback in settings.
+ */
+function outcomeOf(record: DictationRecord, insertRawWhenLlmFails: boolean) {
+  const final = record.finalText?.trim() ?? "";
+  const raw = record.rawTranscript?.trim() ?? "";
+  const salvageable = record.status === "failed" || record.status === "cancelled";
+  const useRaw = final.length === 0 && salvageable && insertRawWhenLlmFails && raw.length > 0;
+  const text = final.length > 0 ? final : useRaw ? raw : undefined;
+
+  return {
+    id: record.id,
+    status: record.status,
+    ...(text !== undefined ? { text } : {}),
+    // "raw" covers both paths that hand back an uncorrected transcript: the pipeline's own
+    // fallback (which already stored it as finalText) and this salvage.
+    isRawFallback: useRaw || (record.status === "failed" && final.length > 0),
+    ...(record.audioDurationMs !== undefined ? { audioDurationMs: record.audioDurationMs } : {}),
+    ...(record.sttLatencyMs !== undefined ? { sttLatencyMs: record.sttLatencyMs } : {}),
+    ...(record.llmLatencyMs !== undefined ? { llmLatencyMs: record.llmLatencyMs } : {}),
+    ...(record.totalLatencyMs !== undefined ? { totalLatencyMs: record.totalLatencyMs } : {}),
+    ...(record.errorCode ? { errorCode: record.errorCode } : {}),
+    ...(record.errorMessage ? { errorMessage: record.errorMessage } : {}),
+    warnings: record.warnings ?? [],
+  };
+}
+
 export function registerDictationRoutes(app: FastifyInstance, ctx: ServerContext): void {
   app.post("/api/dictations", async (request, reply) => {
     const body = request.body;
@@ -119,8 +162,19 @@ export function registerDictationRoutes(app: FastifyInstance, ctx: ServerContext
     }
 
     const controller = new AbortController();
-    // A dropped connection (the agent quit, the user cancelled) must tear the pipeline down.
-    request.raw.on("aborted", () => controller.abort());
+    // A client that walks away deliberately does NOT tear the run down. `req.on("aborted")`
+    // never fires once the body is fully uploaded (verified against Node's http server), so
+    // the listener that used to sit here was dead code — and finishing the run is the better
+    // behaviour anyway: the record lands in the database and `/outcome` can hand the text to
+    // an agent whose connection died at the finish line. Deliberate cancellation goes
+    // through `POST /api/dictations/:id/cancel`, and shutdown through `cancelAll()`.
+    reply.raw.on("close", () => {
+      if (!reply.raw.writableFinished) {
+        ctx.logger.warn("client stopped waiting; finishing the run so the text is recoverable", {
+          dictationId: dictationId ?? "(generated)",
+        });
+      }
+    });
 
     const outcome = await ctx.pipeline.run({
       audio: body,
@@ -175,6 +229,26 @@ export function registerDictationRoutes(app: FastifyInstance, ctx: ServerContext
       return reply.code(404).send({ error: { code: "not_found", message: "no such dictation" } });
     }
     return reply.send(record);
+  });
+
+  /**
+   * The insertable result of a dictation, in the same shape the POST returns.
+   *
+   * The agent calls this when its own POST connection died (a client-side timeout, a
+   * core restart) but the run itself may well have finished: the text is then already in
+   * the database and only the answer was lost. `202` means "still running, ask again";
+   * anything else is final.
+   */
+  app.get<{ Params: { id: string } }>("/api/dictations/:id/outcome", async (request, reply) => {
+    const id = request.params.id;
+    if (ctx.pipeline.isInflight(id)) {
+      return reply.code(202).send({ id, status: "correcting", pending: true });
+    }
+    const record = ctx.db.getDictation(id);
+    if (!record) {
+      return reply.code(404).send({ error: { code: "not_found", message: "no such dictation" } });
+    }
+    return reply.send(outcomeOf(record, ctx.db.getSettings().general.insertRawTranscriptWhenLlmFails));
   });
 
   app.get<{ Params: { id: string } }>("/api/dictations/:id/audio", async (request, reply) => {

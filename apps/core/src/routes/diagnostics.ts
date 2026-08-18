@@ -6,6 +6,7 @@ import {
   APP_VERSION,
   AgentStatusSchema,
   ModelIdSchema,
+  dictationBudgetMs,
   type ProviderId,
 } from "@lvf/shared";
 import type { FastifyInstance } from "fastify";
@@ -277,6 +278,10 @@ export function registerDiagnosticsRoutes(app: FastifyInstance, ctx: ServerConte
       restoreClipboardAfterPaste: settings.general.restoreClipboardAfterPaste,
       clipboardRestoreDelayMs: settings.general.clipboardRestoreDelayMs,
       sendWindowTitle: settings.correction.sendWindowTitle,
+      // How long the agent must be willing to wait on POST /api/dictations. Derived from
+      // the timeouts and the attempt budget below, so raising either one cannot leave the
+      // agent giving up on a run that this core is still legitimately working on.
+      requestBudgetMs: dictationBudgetMs(settings),
     });
   });
 

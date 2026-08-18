@@ -861,7 +861,7 @@ export function Settings() {
             </select>
           </Labeled>
           <NumberField
-            label="LLM timeout (ms)"
+            label="LLM timeout (ms), per attempt"
             value={draft.correction.timeoutMs}
             min={1000}
             max={300000}
@@ -874,6 +874,21 @@ export function Settings() {
             min={0}
             max={200}
             onChange={(v) => patchCorrection({ glossaryMaxTerms: v })}
+          />
+          <NumberField
+            label="LLM attempts per dictation"
+            value={draft.correction.maxAttempts}
+            min={1}
+            max={6}
+            onChange={(v) => patchCorrection({ maxAttempts: v })}
+          />
+          <NumberField
+            label="Retry backoff (ms)"
+            value={draft.correction.retryBackoffMs}
+            min={0}
+            max={10000}
+            step={100}
+            onChange={(v) => patchCorrection({ retryBackoffMs: v })}
           />
           <Toggle
             label="Disable extended thinking"
@@ -967,6 +982,12 @@ export function Settings() {
                   ))}
                 </select>
               </Labeled>
+              <Toggle
+                label="Disable extended thinking on the fallback"
+                checked={draft.correction.fallbackDisableThinking}
+                onChange={(v) => patchCorrection({ fallbackDisableThinking: v })}
+                hint="The fallback runs after the primary already spent its budget, so it is there to be fast."
+              />
             </div>
           )}
         </FieldRow>

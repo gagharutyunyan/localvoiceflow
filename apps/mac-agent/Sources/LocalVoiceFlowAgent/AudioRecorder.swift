@@ -266,9 +266,13 @@ public final class AudioRecorder {
         var localPeak: Float = 0
         for index in 0..<frames {
             let sample = channel[index]
-            let magnitude = abs(sample)
-            if magnitude > localPeak { localPeak = magnitude }
             let clamped = max(-1, min(1, sample))
+            // The peak is measured on the clamped sample, not the raw one. Core Audio hands
+            // out Float32 that legitimately overshoots 1.0 (a hot USB mic, AGC), and the
+            // longer the capture the likelier one such sample is — reporting 3.18 as a
+            // "0...1 level" made core reject the whole upload and the recording was gone.
+            let magnitude = abs(clamped)
+            if magnitude > localPeak { localPeak = magnitude }
             // 32767 rather than 32768 so +1.0 maps to Int16.max instead of wrapping.
             converted[index] = Int16(clamped * 32767)
         }

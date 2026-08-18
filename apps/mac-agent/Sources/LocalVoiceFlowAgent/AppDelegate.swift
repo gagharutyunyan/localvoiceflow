@@ -161,6 +161,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, MenuBarDelegate
         guard let fetched = await core.fetchConfig() else { return }
         config = fetched
         machine.config = fetched.dictationConfig
+        // Core knows how long its own pipeline may take; giving up before that is what
+        // turned finished long dictations into "превышен лимит времени на запрос".
+        core.applyRequestBudget(ms: fetched.requestBudgetMs)
         hud.isEnabled = fetched.hudEnabled
         hotkeys.fnTriggerEnabled = fetched.fnTriggerEnabled
         applyHotkeyConfig()
@@ -464,9 +467,37 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, MenuBarDelegate
                 await MainActor.run { self.deliver(outcome, target: target) }
             } catch {
                 if Task.isCancelled { return }
+                // The POST died, but the run behind it may not have: core writes the record
+                // before it answers, so a connection that dropped at the finish line loses
+                // only the reply. Ask for the outcome by id before calling this a failure.
+                if let recovered = await self.recoverOutcome(id: dictationId, after: error) {
+                    if Task.isCancelled { return }
+                    AgentLog.info("dictation \(dictationId) recovered after a lost connection")
+                    await MainActor.run { self.deliver(recovered, target: target) }
+                    return
+                }
                 await MainActor.run { self.failDictation(error) }
             }
         }
+    }
+
+    /// Polls `GET /api/dictations/:id/outcome` for a run whose POST connection died.
+    ///
+    /// Only transport failures qualify: a 4xx means core never started the run, and asking
+    /// it again would just find nothing. Three quick tries cover the common case — core
+    /// finished a second after the client stopped listening — without stalling the HUD.
+    private func recoverOutcome(id: String, after error: Error) async -> DictationOutcome? {
+        if let clientError = error as? CoreClientError, case .http = clientError { return nil }
+        for attempt in 0..<3 {
+            if Task.isCancelled { return nil }
+            if attempt > 0 {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+            if let outcome = await core.fetchOutcome(id: id), outcome.text?.isEmpty == false {
+                return outcome
+            }
+        }
+        return nil
     }
 
     private func deliver(_ outcome: DictationOutcome, target: TargetAppSnapshot?) {

@@ -500,7 +500,8 @@ class TestAutoMaxTokens(unittest.TestCase):
     def test_scales_with_input_and_is_capped(self) -> None:
         self.assertEqual(auto_max_tokens(0), 256)
         self.assertEqual(auto_max_tokens(100), 456)
-        self.assertEqual(auto_max_tokens(10_000), 2048)
+        self.assertEqual(auto_max_tokens(10_000), 8192)
+        self.assertEqual(auto_max_tokens(3_000), 6256)
 
 
 if __name__ == "__main__":

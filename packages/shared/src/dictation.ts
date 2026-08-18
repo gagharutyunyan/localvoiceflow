@@ -46,8 +46,16 @@ export const DictationContextSchema = z.object({
   windowTitle: z.string().max(500).optional(),
   pid: z.number().int().optional(),
   audioDurationMs: z.number().min(0).optional(),
-  /** Peak amplitude measured by the agent; used to reject silent captures early. */
-  peakAmplitude: z.number().min(0).max(1).optional(),
+  /**
+   * Peak amplitude measured by the agent; used to reject silent captures early.
+   *
+   * Deliberately unbounded above: Core Audio hands out Float32 samples that legitimately
+   * overshoot 1.0 on some input devices (a boosted USB mic, AGC), and the longer the
+   * capture the likelier one such sample is. An upper bound here used to reject the whole
+   * upload with a 400 and throw the recording away — over a number that only ever feeds a
+   * silence heuristic.
+   */
+  peakAmplitude: z.number().min(0).optional(),
   /** Client-side monotonic timestamp of the moment recording stopped, in ms since boot. */
   clientStopUptimeMs: z.number().optional(),
 });

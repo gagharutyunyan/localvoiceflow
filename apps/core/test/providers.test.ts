@@ -312,6 +312,21 @@ describe("failure classification", () => {
     assert.equal(classifyCliFailure("429 Too Many Requests", "", 1, false).code, "llm_rate_limited");
   });
 
+  test("an is_error envelope keeps the CLI's own diagnosis instead of a generic failure", () => {
+    // Opus rejects the top efforts while thinking is off; the CLI reports it inside a
+    // successful-looking JSON envelope, so the code has to come from `result`.
+    const envelope = JSON.stringify({
+      is_error: true,
+      result:
+        "API Error: 400 output_config.effort 'max' is not supported when thinking is disabled on this model. Use effort 'high' or below, or enable thinking.",
+    });
+    assert.throws(
+      () => parseClaudeOutput(envelope),
+      (error: Error & { code?: string; retryable?: boolean }) =>
+        error.code === "llm_model_unavailable" && error.retryable === false,
+    );
+  });
+
   test("network errors are the only retryable class", () => {
     const error = classifyCliFailure("getaddrinfo ENOTFOUND api.example", "", 1, false);
     assert.equal(error.code, "llm_network");

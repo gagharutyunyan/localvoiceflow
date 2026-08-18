@@ -116,7 +116,16 @@ export function parseClaudeOutput(stdout: string): { text: string; meta: ClaudeJ
 
   if (envelope.is_error === true) {
     const detail = typeof envelope.result === "string" ? envelope.result : envelope.subtype;
-    throw new PipelineError("llm_failed", `the CLI reported an error${detail ? `: ${detail}` : ""}`);
+    // The envelope carries the real diagnosis (an API 400 about the model, a rate limit, a
+    // signed-out CLI) in `result`. Flattening all of it to `llm_failed` made the retry
+    // policy treat "this model will never accept this request" as a transient hiccup and
+    // spend the whole attempt budget rediscovering it.
+    const classified = classifyCliFailure(detail ?? "", "", 0, false);
+    throw new PipelineError(
+      classified.code,
+      `the CLI reported an error${detail ? `: ${detail}` : ""}`,
+      { retryable: classified.retryable },
+    );
   }
 
   const structured = CorrectionOutputSchema.safeParse(envelope.structured_output);

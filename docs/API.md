@@ -51,12 +51,22 @@ in headers so no multipart parsing is needed on either side:
 | `X-LVF-Window-Title` | percent-encoded; ignored unless the user enabled it |
 | `X-LVF-Pid` | target process id |
 | `X-LVF-Audio-Duration-Ms` | duration measured by the agent |
-| `X-LVF-Peak-Amplitude` | 0..1 peak, used to reject silent captures early |
+| `X-LVF-Peak-Amplitude` | peak level, used to reject silent captures early; values above 1.0 (Core Audio overshoot) are accepted, not rejected |
 | `X-LVF-Dictation-Id` | optional client-supplied id, so the agent can correlate SSE |
 
 A supplied id must be fresh: if it is already in flight or already present in history the
 request is refused with `409 {"error":{"code":"conflict",...}}` — a client must not retry
 a POST with the same id, it has to mint a new one per capture (the bundled agent does).
+
+Every header above is advisory and is normalised rather than validated: an out-of-range
+number or an over-long name never costs the caller its recording. Only the body has to be
+a real WAV.
+
+**The client must be willing to wait `requestBudgetMs`** (see `GET /api/agent/config`).
+This request sends nothing until the whole pipeline is finished, so a client-side
+inactivity timeout below that budget aborts a dictation core is still working on. When a
+client does lose the connection, the run keeps going — recover the answer with
+`GET /api/dictations/:id/outcome`.
 
 Responds with `DictationOutcome`:
 
@@ -78,6 +88,14 @@ Responds with `DictationOutcome`:
   Nothing is written to history.
 * `status: "failed"` — `errorCode` / `errorMessage` are set. `text` still carries the raw
   transcript when `insertRawTranscriptWhenLlmFails` is on.
+
+### `GET /api/dictations/:id/outcome` → `DictationOutcome`
+
+The result of a run whose `POST` connection died, addressed by the id the client supplied.
+`202` (with `{"pending": true}`) means the run is still going and the caller should ask
+again; `404` means there is nothing to recover. A record that failed or was torn down
+mid-flight answers with the raw transcript when `insertRawTranscriptWhenLlmFails` is on,
+so the user's words survive a lost connection.
 
 ### `POST /api/dictations/:id/cancel`
 
@@ -193,6 +211,12 @@ Opens the directory in Finder. The target is an enum, never a path from the clie
 POST /api/agent/status     body: AgentStatus          (permissions + Fn tap state)
 GET  /api/agent/config     → the subset of settings the agent needs
 ```
+
+`GET /api/agent/config` also carries `requestBudgetMs`: the worst-case wall time one
+dictation may occupy (transcription + `correction.maxAttempts` LLM calls + backoff +
+slack). The agent adopts it as the timeout for `POST /api/dictations` and re-reads it on
+every `settings-changed` event, so raising a timeout in the dashboard can never leave the
+client giving up first.
 
 ## Errors
 
