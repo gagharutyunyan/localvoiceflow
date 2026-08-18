@@ -26,6 +26,7 @@ interface EditorState {
   language: string;
   notes: string;
   enabled: boolean;
+  priority: string;
 }
 
 const EMPTY_EDITOR: EditorState = {
@@ -36,6 +37,7 @@ const EMPTY_EDITOR: EditorState = {
   language: "",
   notes: "",
   enabled: true,
+  priority: "0",
 };
 
 function editorFromTerm(term: DictionaryTerm): EditorState {
@@ -47,6 +49,7 @@ function editorFromTerm(term: DictionaryTerm): EditorState {
     language: term.language ?? "",
     notes: term.notes ?? "",
     enabled: term.enabled,
+    priority: String(term.priority),
   };
 }
 
@@ -56,6 +59,7 @@ function editorToInput(editor: EditorState): DictionaryTermInput {
     .map((alias) => alias.trim())
     .filter((alias) => alias.length > 0);
   const language = LANGUAGES.find((value) => value === editor.language);
+  const priority = Number.parseInt(editor.priority, 10);
   return {
     canonical: editor.canonical.trim(),
     aliases,
@@ -63,6 +67,7 @@ function editorToInput(editor: EditorState): DictionaryTermInput {
     category: editor.category.trim() || null,
     language: language ?? null,
     notes: editor.notes.trim() || null,
+    priority: Number.isFinite(priority) ? Math.min(Math.max(priority, 0), 100) : 0,
   };
 }
 
@@ -538,6 +543,7 @@ export function Dictionary() {
                 <th>Aliases</th>
                 <th>Category</th>
                 <th>Lang</th>
+                <th>Prio</th>
                 <th>State</th>
                 <th className="col-actions">Actions</th>
               </tr>
@@ -545,7 +551,7 @@ export function Dictionary() {
             <tbody>
               {visible.length === 0 && !list.loading && (
                 <tr>
-                  <td colSpan={7} className="muted center">
+                  <td colSpan={8} className="muted center">
                     No terms match.
                   </td>
                 </tr>
@@ -567,6 +573,7 @@ export function Dictionary() {
                   <td className="small-text">{term.aliases.join(", ") || EM_DASH}</td>
                   <td>{term.category ?? EM_DASH}</td>
                   <td>{term.language ?? EM_DASH}</td>
+                  <td>{term.priority > 0 ? term.priority : EM_DASH}</td>
                   <td>
                     <StatusPill tone={term.enabled ? "ok" : "neutral"}>
                       {term.enabled ? "enabled" : "disabled"}
@@ -648,6 +655,19 @@ export function Dictionary() {
                   </option>
                 ))}
               </select>
+            </Labeled>
+            <Labeled label="STT prompt priority (0–100)">
+              <input
+                type="number"
+                min={0}
+                max={100}
+                value={editor.priority}
+                onChange={(event) => setEditor({ ...editor, priority: event.target.value })}
+              />
+              <div className="small-text muted">
+                Whisper's hint holds only ~20 terms. Higher wins a slot; 0 means the term is
+                corrected afterwards instead.
+              </div>
             </Labeled>
             <Labeled label="Notes" wide>
               <textarea

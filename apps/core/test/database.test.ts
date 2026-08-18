@@ -80,6 +80,70 @@ describe("migrations", () => {
   });
 });
 
+describe("dictionary reseed migration", () => {
+  /** Rebuilds a database as it looked before the priority migration shipped. */
+  function openAtVersion2(name: string): DatabaseSync {
+    const raw = new DatabaseSync(join(dir, `${name}.sqlite`));
+    raw.exec(`
+      CREATE TABLE IF NOT EXISTS schema_migrations (
+        version    INTEGER PRIMARY KEY,
+        name       TEXT NOT NULL,
+        applied_at TEXT NOT NULL
+      )
+    `);
+    for (const migration of MIGRATIONS) {
+      if (migration.version > 2) break;
+      raw.exec(migration.up);
+      migration.run?.(raw);
+      raw
+        .prepare("INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)")
+        .run(migration.version, migration.name, new Date().toISOString());
+    }
+    return raw;
+  }
+
+  test("adds new seed terms to a dictionary the user already has", () => {
+    const raw = openAtVersion2("reseed");
+    const ts = new Date().toISOString();
+    // One pre-existing term, hand-edited: a private alias and deliberately disabled.
+    raw
+      .prepare(
+        `INSERT INTO dictionary_terms
+           (id, canonical, canonical_key, aliases, category, language, notes, enabled,
+            created_at, updated_at)
+         VALUES ('own', 'React', 'react', '["мой алиас"]', 'Mine', 'mixed', NULL, 0, ?, ?)`,
+      )
+      .run(ts, ts);
+
+    runMigrations(raw);
+    raw.close();
+
+    const db = Database.open(join(dir, "reseed.sqlite"));
+    const terms = db.listTerms();
+    const canonicals = new Set(terms.map((term) => term.canonical));
+    assert.ok(canonicals.has("Claude Design"), "a new seed term must arrive in an old database");
+    assert.ok(terms.length > 100, `expected the full seed, got ${terms.length}`);
+
+    const react = terms.find((term) => term.canonical === "React")!;
+    assert.equal(react.enabled, false, "a term the user disabled must stay disabled");
+    assert.equal(react.category, "Mine", "hand-edited fields are not overwritten");
+    assert.ok(react.aliases.includes("мой алиас"), "the user's own alias must survive");
+    assert.ok(react.aliases.includes("реакт"), "seed aliases are merged in");
+    assert.ok(react.priority > 0, "the migration fills in the new ranking");
+    db.close();
+  });
+
+  test("leaves a fresh database to seedIfEmpty instead of seeding it twice", () => {
+    const raw = openAtVersion2("reseed-empty");
+    runMigrations(raw);
+    const count = (
+      raw.prepare("SELECT COUNT(*) AS c FROM dictionary_terms").get() as { c: number }
+    ).c;
+    raw.close();
+    assert.equal(count, 0, "an empty dictionary is filled by seeding, not by the migration");
+  });
+});
+
 describe("seeding", () => {
   test("populates the dictionary, app profiles and presets exactly once", () => {
     const db = freshDb("seed");

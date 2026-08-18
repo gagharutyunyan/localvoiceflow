@@ -80,10 +80,18 @@ export function parseCsv(text: string): string[][] {
   return rows;
 }
 
+/**
+ * Undoes the leading apostrophe core adds in front of a cell that a spreadsheet would
+ * evaluate as a formula, so exporting and re-importing a term is lossless.
+ */
+function unguardFormulaCell(text: string): string {
+  return /^'[=+\-@]/.test(text) ? text.slice(1) : text;
+}
+
 function parseAliases(cell: string): string[] {
   return cell
     .split(/[;|]/)
-    .map((alias) => alias.trim())
+    .map((alias) => unguardFormulaCell(alias.trim()))
     .filter((alias) => alias.length > 0);
 }
 
@@ -92,6 +100,13 @@ function parseEnabled(cell: string | undefined): boolean {
   const normalized = cell.trim().toLowerCase();
   if (normalized === "") return true;
   return !["0", "false", "no", "off", "нет", "выкл"].includes(normalized);
+}
+
+/** An absent or malformed cell means "unranked" — never a rejected row. */
+function parsePriority(cell: string | undefined): number {
+  const value = Number.parseInt((cell ?? "").trim(), 10);
+  if (!Number.isFinite(value)) return 0;
+  return Math.min(Math.max(value, 0), 100);
 }
 
 function parseLanguage(cell: string | undefined): TermLanguage | undefined {
@@ -118,12 +133,15 @@ const HEADER_ALIASES: Record<string, string> = {
   enabled: "enabled",
   active: "enabled",
   включен: "enabled",
+  priority: "priority",
+  prio: "priority",
+  приоритет: "priority",
 };
 
 /**
  * Converts CSV rows into the JSON import shape core accepts. A header row is used
  * when recognised; otherwise the fixed order
- * `canonical, aliases, category, language, notes, enabled` is assumed.
+ * `canonical, aliases, category, language, notes, enabled, priority` is assumed.
  */
 export function csvToTerms(rows: string[][]): DictionaryTermInput[] {
   if (rows.length === 0) return [];
@@ -139,7 +157,7 @@ export function csvToTerms(rows: string[][]): DictionaryTermInput[] {
       if (key && !columns.has(key)) columns.set(key, position);
     });
   } else {
-    ["canonical", "aliases", "category", "language", "notes", "enabled"].forEach((key, position) => {
+    ["canonical", "aliases", "category", "language", "notes", "enabled", "priority"].forEach((key, position) => {
       columns.set(key, position);
     });
   }
@@ -153,17 +171,18 @@ export function csvToTerms(rows: string[][]): DictionaryTermInput[] {
       return position === undefined ? undefined : row[position];
     };
 
-    const canonical = (cell("canonical") ?? "").trim();
+    const canonical = unguardFormulaCell((cell("canonical") ?? "").trim());
     if (canonical.length === 0) continue;
 
     const language = parseLanguage(cell("language"));
-    const category = (cell("category") ?? "").trim();
-    const notes = (cell("notes") ?? "").trim();
+    const category = unguardFormulaCell((cell("category") ?? "").trim());
+    const notes = unguardFormulaCell((cell("notes") ?? "").trim());
 
     terms.push({
       canonical,
       aliases: parseAliases(cell("aliases") ?? ""),
       enabled: parseEnabled(cell("enabled")),
+      priority: parsePriority(cell("priority")),
       ...(category ? { category } : {}),
       ...(language ? { language } : {}),
       ...(notes ? { notes } : {}),
@@ -208,6 +227,7 @@ export function jsonToTerms(text: string): DictionaryTermInput[] {
       canonical,
       aliases,
       enabled: record.enabled === undefined ? true : record.enabled !== false,
+      priority: parsePriority(typeof record.priority === "number" ? String(record.priority) : undefined),
       ...(category ? { category } : {}),
       ...(language ? { language } : {}),
       ...(notes ? { notes } : {}),

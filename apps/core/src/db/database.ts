@@ -274,8 +274,9 @@ export class Database {
     this.#db
       .prepare(
         `INSERT INTO dictionary_terms
-           (id, canonical, canonical_key, aliases, category, language, notes, enabled, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           (id, canonical, canonical_key, aliases, category, language, notes, enabled,
+            priority, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -286,6 +287,7 @@ export class Database {
         input.language ?? null,
         input.notes ?? null,
         input.enabled === false ? 0 : 1,
+        input.priority ?? 0,
         ts,
         ts,
       );
@@ -323,6 +325,7 @@ export class Database {
       canonical: String(row.canonical),
       aliases: parseJsonArray(row.aliases),
       enabled: toBool(row.enabled),
+      priority: Number(row.priority ?? 0),
       createdAt: String(row.created_at),
       updatedAt: String(row.updated_at),
     };
@@ -348,13 +351,14 @@ export class Database {
       language: patch.language === undefined ? (current.language ?? null) : patch.language,
       notes: patch.notes === undefined ? (current.notes ?? null) : patch.notes,
       enabled: patch.enabled ?? current.enabled,
+      priority: patch.priority ?? current.priority,
     };
 
     this.#db
       .prepare(
         `UPDATE dictionary_terms
             SET canonical = ?, canonical_key = ?, aliases = ?, category = ?, language = ?,
-                notes = ?, enabled = ?, updated_at = ?
+                notes = ?, enabled = ?, priority = ?, updated_at = ?
           WHERE id = ?`,
       )
       .run(
@@ -365,6 +369,7 @@ export class Database {
         next.language,
         next.notes,
         next.enabled ? 1 : 0,
+        next.priority,
         nowIso(),
         id,
       );
@@ -431,6 +436,9 @@ export class Database {
             language: term.language ?? existing.language ?? null,
             notes: term.notes ?? existing.notes ?? null,
             enabled: term.enabled,
+            // A priority of 0 means "unset" rather than "lowest", so an import that omits
+            // it must not demote a term the user (or the seed) had ranked.
+            priority: term.priority || existing.priority,
           });
           updated += 1;
         } else {

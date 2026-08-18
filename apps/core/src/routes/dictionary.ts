@@ -3,6 +3,7 @@ import {
   DictionaryImportSchema,
   DictionaryTermInputSchema,
   DictionaryTermPatchSchema,
+  TermLanguageSchema,
   applyDeterministicReplacements,
   buildSttInitialPrompt,
   previewCorrectionPayload,
@@ -29,9 +30,18 @@ const CsvImportSchema = z.object({
 });
 
 /**
+ * Undoes the leading apostrophe `dictionaryToCsv` adds in front of a cell that would
+ * otherwise be read as a formula. Without this, exporting and re-importing turns the
+ * term "--dangerously-skip-permissions" into a second, apostrophe-prefixed one.
+ */
+function unguardFormulaCell(text: string): string {
+  return /^'[=+\-@]/.test(text) ? text.slice(1) : text;
+}
+
+/**
  * Minimal CSV reader supporting quoted fields and embedded newlines.
  * Expected columns: canonical, aliases (pipe- or semicolon-separated), category,
- * language, notes, enabled.
+ * language, notes, enabled, priority.
  */
 export function parseDictionaryCsv(text: string): z.infer<typeof DictionaryTermInputSchema>[] {
   const rows: string[][] = [];
@@ -86,29 +96,33 @@ export function parseDictionaryCsv(text: string): z.infer<typeof DictionaryTermI
   const languageIdx = indexOf("language");
   const notesIdx = indexOf("notes");
   const enabledIdx = indexOf("enabled");
+  const priorityIdx = indexOf("priority");
 
   const out: z.infer<typeof DictionaryTermInputSchema>[] = [];
   for (const cells of rows.slice(1)) {
-    const canonical = (cells[canonicalIdx] ?? "").trim();
+    const canonical = unguardFormulaCell((cells[canonicalIdx] ?? "").trim());
     if (canonical.length === 0) continue;
 
     const aliasesRaw = aliasesIdx >= 0 ? (cells[aliasesIdx] ?? "") : "";
     const aliases = aliasesRaw
       .split(/[|;]/)
-      .map((alias) => alias.trim())
+      .map((alias) => unguardFormulaCell(alias.trim()))
       .filter((alias) => alias.length > 0);
 
     const enabledRaw = enabledIdx >= 0 ? (cells[enabledIdx] ?? "").trim().toLowerCase() : "";
     const language = languageIdx >= 0 ? (cells[languageIdx] ?? "").trim() : "";
+    const priority = priorityIdx >= 0 ? Number.parseInt((cells[priorityIdx] ?? "").trim(), 10) : 0;
 
     out.push(
       DictionaryTermInputSchema.parse({
         canonical,
         aliases,
-        category: categoryIdx >= 0 ? (cells[categoryIdx] ?? "").trim() || null : null,
-        language: language === "ru" || language === "en" || language === "mixed" ? language : null,
-        notes: notesIdx >= 0 ? (cells[notesIdx] ?? "").trim() || null : null,
+        category: categoryIdx >= 0 ? unguardFormulaCell((cells[categoryIdx] ?? "").trim()) || null : null,
+        language: TermLanguageSchema.safeParse(language).success ? language : null,
+        notes: notesIdx >= 0 ? unguardFormulaCell((cells[notesIdx] ?? "").trim()) || null : null,
         enabled: enabledRaw === "" ? true : !["0", "false", "no", "нет"].includes(enabledRaw),
+        // A missing or unparseable cell means "unranked", never a rejected import.
+        priority: Number.isFinite(priority) ? Math.min(Math.max(priority, 0), 100) : 0,
       }),
     );
   }
@@ -124,7 +138,7 @@ export function dictionaryToCsv(terms: readonly DictionaryTerm[]): string {
     if (/^[=+\-@]/.test(text)) text = `'${text}`;
     return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
   };
-  const lines = ["canonical,aliases,category,language,notes,enabled"];
+  const lines = ["canonical,aliases,category,language,notes,enabled,priority"];
   for (const term of terms) {
     lines.push(
       [
@@ -134,6 +148,7 @@ export function dictionaryToCsv(terms: readonly DictionaryTerm[]): string {
         escape(term.language),
         escape(term.notes),
         term.enabled ? "true" : "false",
+        String(term.priority),
       ].join(","),
     );
   }

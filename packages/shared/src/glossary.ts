@@ -78,6 +78,9 @@ export function selectGlossary(
     // win ties — but only among terms that actually matched. Adding this unconditionally
     // would give every multi-word term a nonzero score and leak it into the prompt.
     if (score > 0 && term.canonical.includes(" ")) score += 2;
+    // Same reasoning for priority: it breaks ties between terms that already matched,
+    // so when more terms match than `maxTerms` allows, the everyday ones survive the cut.
+    if (score > 0) score += Math.min(term.priority ?? 0, 10);
     scored.push({ term, score });
   }
 
@@ -100,9 +103,12 @@ export function selectGlossary(
  * Builds the short hint handed to Whisper as `initial_prompt`.
  *
  * Whisper's prompt window is small and a long prompt measurably degrades recognition,
- * so only canonical forms go in, capped by character budget. Terms are ordered by the
- * dictionary's own order so the hint stays stable across requests (stable prompts keep
- * decoding deterministic between runs).
+ * so only canonical forms go in, capped by character budget. A dictionary of a few
+ * hundred terms overflows that budget many times over, and the callers hand terms over
+ * in alphabetical order — without ranking, the hint would be whatever happens to sort
+ * first ("API … SQLite") and every `use*` hook would fall off the end. `priority`
+ * therefore decides who gets a slot; ties keep the caller's order, so the hint stays
+ * byte-identical between requests (stable prompts keep decoding deterministic).
  */
 export function buildSttInitialPrompt(
   terms: readonly DictionaryTerm[],
@@ -113,7 +119,10 @@ export function buildSttInitialPrompt(
   const parts: string[] = [];
   let used = 0;
 
-  for (const term of terms) {
+  // Array.prototype.sort is stable, so equal priorities preserve the incoming order.
+  const ranked = [...terms].sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0));
+
+  for (const term of ranked) {
     if (!term.enabled) continue;
     const canonical = term.canonical.trim();
     if (canonical.length === 0) continue;

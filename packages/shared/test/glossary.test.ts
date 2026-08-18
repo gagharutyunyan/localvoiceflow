@@ -279,6 +279,24 @@ describe("stt initial prompt", () => {
     assert.equal(buildSttInitialPrompt(TERMS, 0), "");
   });
 
+  test("priority decides who gets a slot, not alphabetical luck", () => {
+    // The budget fits one term. Without ranking, "AAA" would win purely by sorting first.
+    const ranked: DictionaryTerm[] = [
+      { ...term("AAA", []), priority: 0 },
+      { ...term("useEffect", []), priority: 5 },
+    ];
+    assert.equal(buildSttInitialPrompt(ranked, 9), "useEffect");
+  });
+
+  test("equal priorities keep the caller's order, so the hint stays byte-identical", () => {
+    const ranked: DictionaryTerm[] = [
+      { ...term("Zod", []), priority: 3 },
+      { ...term("Vite", []), priority: 3 },
+      { ...term("React", []), priority: 3 },
+    ];
+    assert.equal(buildSttInitialPrompt(ranked, 200), "Zod, Vite, React");
+  });
+
   test("is stable across calls, which keeps decoding reproducible", () => {
     assert.equal(buildSttInitialPrompt(TERMS, 120), buildSttInitialPrompt(TERMS, 120));
   });

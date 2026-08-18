@@ -129,7 +129,9 @@ PATCH  /api/dictionary/:id            → DictionaryTerm          (body: Diction
 DELETE /api/dictionary/:id
 POST   /api/dictionary/bulk           → { updated: number }     (body: { ids, enabled })
 POST   /api/dictionary/import         → { created, updated, skipped, duplicates }
-GET    /api/dictionary/export?format=json|csv
+GET    /api/dictionary/export?format=json|csv   (CSV columns: canonical, aliases,
+                                                 category, language, notes, enabled,
+                                                 priority)
 POST   /api/dictionary/preview        → glossary preview, see below
 ```
 

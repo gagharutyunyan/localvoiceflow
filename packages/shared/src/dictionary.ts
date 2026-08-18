@@ -12,6 +12,7 @@ export const DictionaryTermSchema = z.object({
   language: TermLanguageSchema.optional(),
   notes: z.string().max(2000).optional(),
   enabled: z.boolean().default(true),
+  priority: z.number().int().min(0).max(100).default(0),
   createdAt: z.string(),
   updatedAt: z.string(),
 });
@@ -25,6 +26,16 @@ export const DictionaryTermInputSchema = z.object({
   language: TermLanguageSchema.optional().nullable(),
   notes: z.string().max(2000).optional().nullable(),
   enabled: z.boolean().default(true),
+  /**
+   * How badly this term deserves a slot in Whisper's `initial_prompt`.
+   *
+   * That prompt is capped at a couple of hundred characters, so a dictionary of several
+   * hundred terms cannot fit and the alphabetical order the table is read in would decide
+   * the cut arbitrarily — "SQLite" in, "useEffect" out. Higher priority wins the slot;
+   * everything else keeps working through the deterministic pass and the LLM glossary,
+   * which have no such budget.
+   */
+  priority: z.number().int().min(0).max(100).default(0),
 });
 
 export type DictionaryTermInput = z.infer<typeof DictionaryTermInputSchema>;
@@ -94,4 +105,68 @@ export const AMBIGUOUS_ALIAS_DENYLIST: ReadonlySet<string> = new Set([
   "стиль",
   "мутация",
   "инвалидировать",
+  // Ordinary Russian nouns that a well-meaning alias would turn into bare English inside
+  // a Russian sentence. They are listed even when no seed term claims them, so that a
+  // term added later through the UI cannot quietly start rewriting normal speech.
+  "ветка",
+  "ветку",
+  "сборка",
+  "сборку",
+  "поток",
+  "очередь",
+  "задача",
+  "задачу",
+  "окно",
+  "среда",
+  "объект",
+  "массив",
+  "строка",
+  "строку",
+  "число",
+  "функция",
+  "функцию",
+  "класс",
+  "метод",
+  "свойство",
+  "значение",
+  "ключ",
+  "список",
+  "таблица",
+  "таблицу",
+  "база",
+  "базу",
+  "сервер",
+  "клиент",
+  "сеть",
+  "файл",
+  "папка",
+  "папку",
+  "версия",
+  "версию",
+  "ошибка",
+  "ошибку",
+  "тест",
+  "тесты",
+  "сообщение",
+  "событие",
+  "правило",
+  "модуль",
+  "пакет",
+  "проект",
+  "сессия",
+  "пользователь",
+  "память",
+  "ссылка",
+  "ссылку",
+  "заголовок",
+  "тело",
+  "точку",
+  "конце",
+  "вид",
+  "виды",
+  "поля",
+  "поле",
+  "пути",
+  "коды",
+  "типы",
 ]);
